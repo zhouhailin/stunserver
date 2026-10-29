@@ -1,50 +1,118 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+<!--
+Sync Impact Report
+==================
+Version change: N/A → 1.0.0 (initial ratification)
+Modified principles: N/A (initial creation)
+Added sections:
+  - Core Principles (5 principles)
+  - Technology Stack
+  - Development Workflow
+  - Governance
+Removed sections: N/A
+Follow-up TODOs: None
+-->
+
+# STUN Server Constitution
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. RFC 5389 Compliance
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+All STUN protocol implementations MUST strictly conform to RFC 5389
+(Session Traversal Utilities for NAT). Any deviation from the RFC
+MUST be documented with justification and reviewed for interoperability
+impact. Protocol attributes, message types, and error codes MUST match
+the RFC specification exactly.
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+**Rationale**: STUN is a standardized protocol. Non-compliant
+implementations will fail to interoperate with other STUN clients
+and servers in the ecosystem.
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### II. Test-Driven Development (NON-NEGOTIABLE)
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+All features and bug fixes MUST follow TDD discipline:
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+1. Write failing tests first that define expected behavior
+2. Verify tests fail for the right reason
+3. Implement minimum code to make tests pass
+4. Refactor while keeping tests green
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+No implementation code SHALL be written without a corresponding
+failing test. Test coverage MUST NOT decrease.
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+**Rationale**: TDD ensures correctness, prevents regressions, and
+serves as living documentation. For a protocol implementation,
+tests are the primary defense against subtle interoperability bugs.
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+### III. Performance-First Design
+
+As a high-performance STUN server, all design decisions MUST consider
+performance impact:
+
+- Network I/O MUST use async/non-blocking patterns
+- Memory allocations in hot paths MUST be minimized
+- Connection handling MUST scale to thousands of concurrent clients
+- Benchmark critical paths and set performance regression thresholds
+
+**Rationale**: STUN servers operate on the critical path of real-time
+communication. Latency and throughput directly affect user experience.
+
+### IV. Code Quality Gates
+
+All code MUST pass the following quality gates before merge:
+
+- `cargo fmt` — formatting MUST match rustfmt defaults
+- `cargo clippy -- -D warnings` — zero clippy warnings allowed
+- `cargo test` — all tests MUST pass
+- No `unsafe` blocks without explicit justification and review
+
+**Rationale**: Consistent code quality reduces review burden and
+prevents entire categories of bugs. Rust's type system is our
+primary safety net; `unsafe` bypasses that guarantee.
+
+### V. Simplicity and YAGNI
+
+Start with the simplest implementation that satisfies the requirement.
+Do not add abstraction, features, or optimization until a concrete
+need is demonstrated. Every line of code is a liability — minimize it.
+
+**Rationale**: Premature optimization and over-engineering are the
+primary sources of complexity. A simple, correct implementation
+is always preferred over a clever, complex one.
+
+## Technology Stack
+
+- **Language**: Rust (stable toolchain, latest edition)
+- **Build**: Cargo (standard build, test, fmt, clippy commands)
+- **Async Runtime**: Tokio (for network I/O)
+- **Testing**: cargo test + integration tests in `tests/`
+- **Linting**: clippy with all warnings as errors
+- **Formatting**: rustfmt with default configuration
+
+## Development Workflow
+
+- **Commits**: Conventional Commits format (`feat:`, `fix:`, `docs:`,
+  `test:`, `refactor:`, `chore:`)
+- **Branches**: `type/description` (e.g., `feat/stun-binding`,
+  `fix/attribute-parsing`)
+- **Pull Requests**: All changes require review. Verify:
+  - Tests pass (`cargo test`)
+  - No clippy warnings (`cargo clippy -- -D warnings`)
+  - Code formatted (`cargo fmt --check`)
+  - RFC compliance verified for protocol changes
+- **Verification**: Run `/verify` skill before marking tasks complete
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+This constitution supersedes all other development practices and
+conventions. Amendments require:
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+1. Documentation of the proposed change via pull request
+2. Rationale explaining why the change is necessary
+3. Migration plan if the change affects existing code
+4. Approval from project maintainers
+
+All contributors MUST verify compliance with this constitution
+during code review. Violations MUST be fixed before merge.
+
+**Version**: 1.0.0 | **Ratified**: 2026-10-29 | **Last Amended**: 2026-10-29
