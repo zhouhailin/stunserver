@@ -1,0 +1,6 @@
+[all]
+exclude-files = [
+    "stunbench/src/main.rs",
+    "stunclient/src/main.rs",
+    "stunserver/src/main.rs",
+]

@@ -277,4 +277,72 @@ mod tests {
         let client_addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
         assert!(build_response(&[], client_addr).is_none());
     }
+
+    #[test]
+    fn test_server_state_default() {
+        let state = ServerState::default();
+        assert_eq!(state.request_count.load(Ordering::Relaxed), 0);
+        assert_eq!(state.error_count.load(Ordering::Relaxed), 0);
+        assert!(!state.timezone.is_empty());
+    }
+
+    #[test]
+    fn test_build_response_with_multiple_attributes() {
+        let transaction_id = [5; 12];
+        let mut request = StunMessage::new(StunMessageType::Request, transaction_id);
+        let attr = StunAttribute::new(StunAttributeType::Software, b"test-client".to_vec());
+        request.add_attribute(attr);
+        let request_bytes = request.encode();
+
+        let client_addr: SocketAddr = "172.16.0.1:8080".parse().unwrap();
+        let response_bytes = build_response(&request_bytes, client_addr).unwrap();
+
+        let response = StunMessage::decode(&response_bytes).unwrap();
+        assert_eq!(response.message_type, StunMessageType::Response);
+        assert_eq!(response.transaction_id, transaction_id);
+    }
+
+    #[test]
+    fn test_build_response_with_port_zero() {
+        let transaction_id = [7; 12];
+        let request = StunMessage::new(StunMessageType::Request, transaction_id);
+        let request_bytes = request.encode();
+
+        let client_addr: SocketAddr = "192.168.1.1:0".parse().unwrap();
+        let response_bytes = build_response(&request_bytes, client_addr).unwrap();
+
+        let response = StunMessage::decode(&response_bytes).unwrap();
+        let mapped = MappedAddress::decode_xor(
+            &response.attributes[0].attribute_value,
+            response.magic_cookie,
+            &response.transaction_id,
+        )
+        .unwrap();
+        assert_eq!(mapped.port, 0);
+    }
+
+    #[test]
+    fn test_server_state_concurrent_counters() {
+        use std::thread;
+
+        let state = Arc::new(ServerState::new());
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let state_clone = state.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    state_clone.inc_requests();
+                    state_clone.inc_errors();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(state.request_count.load(Ordering::Relaxed), 1000);
+        assert_eq!(state.error_count.load(Ordering::Relaxed), 1000);
+    }
 }

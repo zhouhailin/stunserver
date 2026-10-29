@@ -242,6 +242,7 @@ mod tests {
     use super::*;
     use crate::config::FileSize;
     use crate::config::LogRotation;
+    use log::Log;
     use std::io::Read;
 
     #[test]
@@ -383,5 +384,206 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_stun_logger_enabled() {
+        let logger = StunLogger {
+            output: LogOutput::Console,
+            level: LogLevel::Info,
+        };
+
+        let info_meta = log::MetadataBuilder::new().level(log::Level::Info).build();
+        let debug_meta = log::MetadataBuilder::new().level(log::Level::Debug).build();
+        let error_meta = log::MetadataBuilder::new().level(log::Level::Error).build();
+
+        assert!(logger.enabled(&info_meta));
+        assert!(!logger.enabled(&debug_meta));
+        assert!(logger.enabled(&error_meta));
+    }
+
+    #[test]
+    fn test_stun_logger_log_console() {
+        let logger = StunLogger {
+            output: LogOutput::Console,
+            level: LogLevel::Info,
+        };
+
+        let record = log::Record::builder()
+            .args(format_args!("console test message"))
+            .level(log::Level::Info)
+            .build();
+
+        logger.log(&record);
+    }
+
+    #[test]
+    fn test_stun_logger_log_file() {
+        let dir = std::env::temp_dir().join("stunserver_test_logger_file_output");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let log_path = dir.join("test.log");
+        let config = FileLogConfig {
+            path: log_path.clone(),
+            max_size: FileSize(1024 * 1024),
+            rotation: LogRotation::Daily,
+            max_files: 3,
+        };
+
+        let file_logger = FileLogger::new(&config).unwrap();
+        if let Ok(mut guard) = FILE_LOGGER.lock() {
+            *guard = Some(file_logger);
+        }
+
+        let logger = StunLogger {
+            output: LogOutput::File,
+            level: LogLevel::Info,
+        };
+
+        let record = log::Record::builder()
+            .args(format_args!("file test message"))
+            .level(log::Level::Info)
+            .build();
+
+        logger.log(&record);
+        logger.flush();
+
+        let mut contents = String::new();
+        File::open(&log_path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert!(contents.contains("[INFO] file test message"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_stun_logger_log_both() {
+        let dir = std::env::temp_dir().join("stunserver_test_logger_both_output");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let log_path = dir.join("test.log");
+        let config = FileLogConfig {
+            path: log_path.clone(),
+            max_size: FileSize(1024 * 1024),
+            rotation: LogRotation::Daily,
+            max_files: 3,
+        };
+
+        let file_logger = FileLogger::new(&config).unwrap();
+        if let Ok(mut guard) = FILE_LOGGER.lock() {
+            *guard = Some(file_logger);
+        }
+
+        let logger = StunLogger {
+            output: LogOutput::Both,
+            level: LogLevel::Info,
+        };
+
+        let record = log::Record::builder()
+            .args(format_args!("both test message"))
+            .level(log::Level::Info)
+            .build();
+
+        logger.log(&record);
+        logger.flush();
+
+        let mut contents = String::new();
+        File::open(&log_path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert!(contents.contains("[INFO] both test message"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_stun_logger_log_disabled() {
+        let logger = StunLogger {
+            output: LogOutput::Console,
+            level: LogLevel::Error,
+        };
+
+        let record = log::Record::builder()
+            .args(format_args!("debug message"))
+            .level(log::Level::Debug)
+            .build();
+
+        logger.log(&record);
+    }
+
+    #[test]
+    fn test_file_logger_daily_rotation() {
+        let dir = std::env::temp_dir().join("stunserver_test_logger_daily");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let log_path = dir.join("test.log");
+        let config = FileLogConfig {
+            path: log_path.clone(),
+            max_size: FileSize(1024 * 1024),
+            rotation: LogRotation::Daily,
+            max_files: 3,
+        };
+
+        let mut logger = FileLogger::new(&config).unwrap();
+        logger.current_date = "2020-01-01".to_string();
+
+        let record = log::Record::builder()
+            .args(format_args!("daily rotation test"))
+            .level(log::Level::Info)
+            .build();
+
+        logger.write_log(&record).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_logger_rotate_with_existing_files() {
+        let dir = std::env::temp_dir().join("stunserver_test_logger_rotate_existing");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let log_path = dir.join("test.log");
+        let config = FileLogConfig {
+            path: log_path.clone(),
+            max_size: FileSize(10),
+            rotation: LogRotation::Daily,
+            max_files: 5,
+        };
+
+        let mut logger = FileLogger::new(&config).unwrap();
+
+        File::create(dir.join("test.log.2026-10-29")).unwrap();
+
+        let record = log::Record::builder()
+            .args(format_args!(
+                "message to trigger rotation with existing file"
+            ))
+            .level(log::Level::Info)
+            .build();
+
+        logger.write_log(&record).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_stun_logger_flush_without_file_logger() {
+        let logger = StunLogger {
+            output: LogOutput::File,
+            level: LogLevel::Info,
+        };
+
+        if let Ok(mut guard) = FILE_LOGGER.lock() {
+            *guard = None;
+        }
+
+        logger.flush();
     }
 }
