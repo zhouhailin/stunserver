@@ -116,7 +116,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<BenchmarkStats, Strin
             let request = StunMessage::new(StunMessageType::Request, transaction_id);
             let request_bytes = request.encode();
 
-            log::debug!("Sending: {:02x?}", &request_bytes);
+            log::debug!("Sending: {:02x?}", request_bytes);
 
             match sender_socket.send_to(&request_bytes, server_addr).await {
                 Ok(_) => {

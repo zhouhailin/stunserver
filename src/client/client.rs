@@ -60,7 +60,7 @@ pub async fn send_binding_request(
     let request = StunMessage::new(StunMessageType::Request, transaction_id);
     let request_bytes = request.encode();
 
-    log::debug!("Sending: {:02x?}", &request_bytes);
+    log::debug!("Sending: {:02x?}", request_bytes);
 
     let start = Instant::now();
 
