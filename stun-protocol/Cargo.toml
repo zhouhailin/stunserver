@@ -1,0 +1,13 @@
+[package]
+name = "stun-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "STUN protocol implementation (RFC 5389)"
+
+[dependencies]
+byteorder.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
