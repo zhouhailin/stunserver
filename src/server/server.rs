@@ -131,11 +131,11 @@ pub async fn run_server(
                         tokio::spawn(async move {
                             state.inc_requests();
                             debug!("Request from {} ({} bytes)", client_addr, len);
-                            debug!("Received: {:02x?}", &data);
+                            debug!("Received: {:02x?}", data);
 
                             match build_response(&data, client_addr) {
                                 Some(response) => {
-                                    debug!("Response: {:02x?}", &response);
+                                    debug!("Response: {:02x?}", response);
                                     if let Err(e) = sock.send_to(&response, client_addr).await {
                                         state.inc_errors();
                                         warn!("Failed to send response to {}: {}", client_addr, e);
