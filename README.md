@@ -54,12 +54,29 @@ cargo test --all
 ### Test with Client
 
 ```bash
-# Send a binding request to the server
+# Send a binding request with IP and port
 ./target/release/stunclient 127.0.0.1:3478
+
+# Send a binding request with IP only (defaults to port 3478)
+./target/release/stunclient 127.0.0.1
+
+# Send a binding request with domain name (DNS resolution, defaults to port 3478)
+./target/release/stunclient stunserver2025.stunprotocol.org
+
+# Send a binding request with domain name and explicit port
+./target/release/stunclient stunserver2025.stunprotocol.org:3478
 
 # With custom timeout
 ./target/release/stunclient --timeout 10 127.0.0.1:3478
 ```
+
+The client supports:
+- **IPv4 addresses**: `192.168.1.1` or `192.168.1.1:3478`
+- **IPv6 addresses**: `[::1]` or `[::1]:3478`
+- **Domain names**: `example.com` or `example.com:3478`
+- **Default port**: 3478 (STUN standard port) when not specified
+- **DNS resolution**: Automatically resolves domain names with fallback support
+- **Quiet mode**: Use `--quiet` to suppress startup log
 
 ### Run Benchmark
 
@@ -125,23 +142,41 @@ sudo systemctl status stunserver
 
 ## Build Metadata
 
-All executables display build metadata at startup:
+All executables display build metadata at startup in a concise, machine-readable format:
 
 ```
-STUN Server v0.1.0
-Commit: 84b9fd3
-Commit Time: 2026-10-29T14:09:36+08:00 (UTC)
-Build Time: 2026-10-29T07:08:26.866368193+00:00 (UTC)
-Startup Time: 2026-10-29T07:08:27.302703918+00:00 (UTC)
-Startup Time: 2026-10-29T15:08:27.302737453+08:00 (+08:00)
+stunserver v0.1.0 commit=14991861ab505fc80ce23b5ad3651349ba138299 compiled=2026-10-29T18:59:21+08:00 started=2026-10-29T19:01:24+08:00
 ```
 
 This includes:
-- Application version (from Cargo.toml)
-- Git commit ID (short hash)
-- Git commit timestamp
-- Build timestamp
-- Startup time (UTC and local timezone)
+- Application name and version (from Cargo.toml)
+- Git commit ID (full 40-character hash)
+- Compilation timestamp (RFC 3339 format with local timezone)
+- Startup timestamp (RFC 3339 format with local timezone)
+- "-dirty" suffix appended to version if uncommitted changes exist
+
+Use `--quiet` flag to suppress startup log output.
+
+### Version Information
+
+All executables display version information in `--help` output:
+
+```bash
+$ ./target/release/stunserver --help
+stunserver 0.1.0-dirty (commit 14991861ab505fc80ce23b5ad3651349ba138299, compiled 2026-10-29T18:59:21+08:00)
+
+High-performance STUN server
+
+Usage: stunserver [OPTIONS]
+...
+```
+
+The `--version` flag also outputs version information:
+
+```bash
+$ ./target/release/stunserver --version
+stunserver 0.1.0
+```
 
 ## Development
 
@@ -149,10 +184,12 @@ This includes:
 
 ```
 stunserver/
-├── stun-protocol/      # STUN protocol library
-├── stunserver/         # STUN server binary
-├── stunclient/         # STUN client binary
-├── stunbench/          # Benchmark tool binary
+├── crates/
+│   └── stun-protocol/  # STUN protocol library
+├── src/
+│   ├── server/         # STUN server binary
+│   ├── client/         # STUN client binary
+│   └── bench/          # Benchmark tool binary
 ├── config/             # Example configurations
 ├── systemd/            # systemd service files
 └── .github/workflows/  # CI/CD workflows
