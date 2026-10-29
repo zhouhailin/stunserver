@@ -1,6 +1,6 @@
 [Unit]
 Description=STUN Server - Session Traversal Utilities for NAT
-Documentation=https://github.com/stunserver/stunserver
+Documentation=https://github.com/zhouhailin/stunserver
 After=network.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 User=stunserver
 Group=stunserver
-ExecStart=/usr/local/bin/stunserver --config /etc/stunserver/config.yaml
+ExecStart=/opt/stunserver/bin/stunserver --config /opt/stunserver/etc/stunserver.conf
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -19,7 +19,7 @@ SyslogIdentifier=stunserver
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/stunserver
+ReadWritePaths=/opt/stunserver/log
 PrivateTmp=true
 
 # Resource limits

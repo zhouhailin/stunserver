@@ -1,0 +1,35 @@
+# Docker Compose for STUN Server
+# Usage: docker compose up -d
+
+services:
+  stunserver:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: stunserver:latest
+    container_name: stunserver
+    restart: unless-stopped
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+    volumes:
+      - ./config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro
+      - stunserver-logs:/opt/stunserver/log
+    environment:
+      - STUN_LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "3478"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - stunserver-net
+
+volumes:
+  stunserver-logs:
+    driver: local
+
+networks:
+  stunserver-net:
+    driver: bridge

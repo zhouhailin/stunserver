@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Packaging & Deployment
+- Root `Makefile` with development commands: `build`, `test`, `package`, `clean`, `fmt`, `lint`, `help`
+- Deployment `deploy/Makefile` with systemd integration: `install`, `uninstall`, `start`, `stop`, `restart`, `status`
+- Standardized installation directory structure: `/opt/stunserver/{bin,etc,log}`
+- TOML configuration file support (replacing YAML)
+- Example configuration file: `deploy/stunserver.conf.example`
+- Log rotation with configurable size (100MB default) and retention (30 days default)
+
+#### Docker Support
+- Multi-stage `docker/Dockerfile` (rust:1.75-alpine builder + alpine:3.19 runtime)
+- Docker entrypoint script with environment variable overrides (`STUN_CONFIG_PATH`, `STUN_LOG_LEVEL`, `STUN_PORT`, `STUN_LISTEN_ADDRESS`)
+- Docker Compose example: `docker/docker-compose.yml`
+- `.dockerignore` for optimized build context
+- Non-root user execution in container (UID 1000)
+- Health check configuration (30s interval, 10s timeout)
+
+#### CI/CD
+- GitHub Actions workflow for automated Docker image builds (`.github/workflows/docker-publish.yml`)
+- Multi-platform support: linux/amd64, linux/arm64
+- Automatic publishing to GitHub Container Registry (ghcr.io)
+- Semantic versioning tags for releases
+
+#### Documentation
+- Comprehensive English README with deployment guide
+- Chinese README (README.zh-CN.md) with complete translation
+- Updated systemd service file with new paths and GitHub URL
+
 #### Project Structure
 - Reorganized codebase into Rust workspace best practices structure
 - Application code moved to `src/server`, `src/client`, `src/bench`

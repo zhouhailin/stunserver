@@ -35,3 +35,11 @@ rustc-ice-*.txt
 # OS files
 .DS_Store
 Thumbs.db
+
+# Distribution packages
+dist/
+*.tar.gz
+
+# Test artifacts
+test-logs/
+test-config/

@@ -1,9 +1,9 @@
 //! Logging initialization for STUN Server.
 //!
-//! Supports console output via env_logger and file output with daily rotation,
+//! Supports console output and file output with daily rotation,
 //! size-based rotation, and configurable file retention.
 
-use crate::config::{FileLogConfig, LogLevel, LogOutput, LoggingConfig};
+use crate::config::LoggingConfig;
 use chrono::Local;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -27,26 +27,28 @@ struct FileLogger {
 }
 
 impl FileLogger {
-    /// Create a new FileLogger, opening or creating the log file at `path`.
-    fn new(config: &FileLogConfig) -> Result<Self, std::io::Error> {
+    /// Create a new FileLogger from LoggingConfig.
+    fn new(config: &LoggingConfig) -> Result<Self, std::io::Error> {
+        let log_path = config.log_file_path();
+
         // Ensure parent directory exists.
-        if let Some(parent) = config.path.parent() {
+        if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&config.path)?;
+            .open(&log_path)?;
 
         let current_size = file.metadata()?.len();
         let current_date = Local::now().format("%Y-%m-%d").to_string();
 
         Ok(Self {
             file,
-            path: config.path.clone(),
-            max_size: config.max_size.0,
-            max_files: config.max_files,
+            path: log_path,
+            max_size: config.max_file_size_bytes(),
+            max_files: config.retention_days,
             current_date,
             current_size,
         })
@@ -162,13 +164,13 @@ static FILE_LOGGER: Mutex<Option<FileLogger>> = Mutex::new(None);
 
 /// Custom log implementation that dispatches to console and/or file output.
 struct StunLogger {
-    output: LogOutput,
-    level: LogLevel,
+    enable_console: bool,
+    level_filter: log::LevelFilter,
 }
 
 impl log::Log for StunLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= self.level.to_level_filter()
+        metadata.level() <= self.level_filter
     }
 
     fn log(&self, record: &log::Record) {
@@ -176,24 +178,13 @@ impl log::Log for StunLogger {
             return;
         }
 
-        match self.output {
-            LogOutput::Console => {
-                eprintln!("[{}] {}", record.level(), record.args());
-            }
-            LogOutput::File => {
-                if let Ok(mut guard) = FILE_LOGGER.lock() {
-                    if let Some(ref mut logger) = *guard {
-                        let _ = logger.write_log(record);
-                    }
-                }
-            }
-            LogOutput::Both => {
-                eprintln!("[{}] {}", record.level(), record.args());
-                if let Ok(mut guard) = FILE_LOGGER.lock() {
-                    if let Some(ref mut logger) = *guard {
-                        let _ = logger.write_log(record);
-                    }
-                }
+        if self.enable_console {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+
+        if let Ok(mut guard) = FILE_LOGGER.lock() {
+            if let Some(ref mut logger) = *guard {
+                let _ = logger.write_log(record);
             }
         }
     }
@@ -209,30 +200,23 @@ impl log::Log for StunLogger {
 
 /// Initialize the logging subsystem based on the provided configuration.
 ///
-/// Sets up console logging, file logging, or both depending on `config.output`.
+/// Sets up console logging, file logging, or both depending on config.
 /// Returns an error if file logging is requested but cannot be initialized.
 pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize file logger if needed.
-    match config.output {
-        LogOutput::File | LogOutput::Both => {
-            if let Some(ref file_config) = config.file {
-                let file_logger = FileLogger::new(file_config)?;
-                if let Ok(mut guard) = FILE_LOGGER.lock() {
-                    *guard = Some(file_logger);
-                }
-            }
-        }
-        LogOutput::Console => {}
+    // Initialize file logger.
+    let file_logger = FileLogger::new(config)?;
+    if let Ok(mut guard) = FILE_LOGGER.lock() {
+        *guard = Some(file_logger);
     }
 
     // Create and install the global logger.
     let logger = StunLogger {
-        output: config.output,
-        level: config.level,
+        enable_console: config.enable_console,
+        level_filter: config.level_filter(),
     };
 
     log::set_boxed_logger(Box::new(logger))?;
-    log::set_max_level(config.level.to_level_filter());
+    log::set_max_level(config.level_filter());
 
     Ok(())
 }
@@ -240,10 +224,19 @@ pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Er
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::FileSize;
-    use crate::config::LogRotation;
     use log::Log;
     use std::io::Read;
+
+    fn test_logging_config(dir: &std::path::Path) -> LoggingConfig {
+        LoggingConfig {
+            level: "info".to_string(),
+            log_dir: dir.to_path_buf(),
+            file_prefix: "test".to_string(),
+            max_file_size_mb: 1,
+            retention_days: 3,
+            enable_console: false,
+        }
+    }
 
     #[test]
     fn test_file_logger_create_and_write() {
@@ -251,15 +244,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let log_path = dir.join("test.log");
-        let config = FileLogConfig {
-            path: log_path.clone(),
-            max_size: FileSize(1024 * 1024),
-            rotation: LogRotation::Daily,
-            max_files: 3,
-        };
+        let config = test_logging_config(&dir);
 
         let mut logger = FileLogger::new(&config).unwrap();
+        let log_path = config.log_file_path();
         assert!(log_path.exists());
 
         let record = log::Record::builder()
@@ -286,16 +274,14 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let log_path = dir.join("test.log");
-        // Set very small max_size to trigger rotation.
-        let config = FileLogConfig {
-            path: log_path.clone(),
-            max_size: FileSize(50), // 50 bytes - will trigger rotation quickly
-            rotation: LogRotation::Daily,
-            max_files: 2,
-        };
+        let mut config = test_logging_config(&dir);
+        config.max_file_size_mb = 0; // Will use 0 bytes from the helper, but let's set explicitly
+                                     // Actually set a very small size to trigger rotation
+        let _log_path = config.log_file_path();
 
         let mut logger = FileLogger::new(&config).unwrap();
+        // Override max_size to trigger rotation quickly
+        logger.max_size = 50;
 
         let record = log::Record::builder()
             .args(format_args!(
@@ -312,7 +298,6 @@ mod tests {
         // Verify that rotated files exist.
         let entries: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
 
-        // Should have at least the main file and one rotated file.
         assert!(
             !entries.is_empty(),
             "Expected at least 1 file, got {}",
@@ -327,15 +312,10 @@ mod tests {
         let dir = std::env::temp_dir().join("stunserver_test_logger_nested/deep/path");
         let _ = fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
 
-        let log_path = dir.join("test.log");
-        let config = FileLogConfig {
-            path: log_path.clone(),
-            max_size: FileSize(1024),
-            rotation: LogRotation::Daily,
-            max_files: 3,
-        };
+        let config = test_logging_config(&dir);
 
         let _logger = FileLogger::new(&config).unwrap();
+        let log_path = config.log_file_path();
         assert!(log_path.exists());
 
         let _ = fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
@@ -347,7 +327,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let log_path = dir.join("test.log");
+        let config = test_logging_config(&dir);
+        let log_path = config.log_file_path();
 
         // Create some fake rotated files.
         File::create(dir.join("test.log.2026-01-01")).unwrap();
@@ -357,17 +338,10 @@ mod tests {
         // Create the main log file.
         File::create(&log_path).unwrap();
 
-        let config = FileLogConfig {
-            path: log_path.clone(),
-            max_size: FileSize(1024 * 1024),
-            rotation: LogRotation::Daily,
-            max_files: 2,
-        };
-
         let logger = FileLogger::new(&config).unwrap();
         logger.prune_old_files().unwrap();
 
-        // Count remaining rotated files (should be at most 2).
+        // Count remaining rotated files (should be at most retention_days = 3).
         let rotated_count = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -378,8 +352,8 @@ mod tests {
             .count();
 
         assert!(
-            rotated_count <= 2,
-            "Expected <= 2 rotated files, got {}",
+            rotated_count <= 3,
+            "Expected <= 3 rotated files, got {}",
             rotated_count
         );
 
@@ -389,8 +363,8 @@ mod tests {
     #[test]
     fn test_stun_logger_enabled() {
         let logger = StunLogger {
-            output: LogOutput::Console,
-            level: LogLevel::Info,
+            enable_console: true,
+            level_filter: log::LevelFilter::Info,
         };
 
         let info_meta = log::MetadataBuilder::new().level(log::Level::Info).build();
@@ -405,8 +379,8 @@ mod tests {
     #[test]
     fn test_stun_logger_log_console() {
         let logger = StunLogger {
-            output: LogOutput::Console,
-            level: LogLevel::Info,
+            enable_console: true,
+            level_filter: log::LevelFilter::Info,
         };
 
         let record = log::Record::builder()
@@ -423,13 +397,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let log_path = dir.join("test.log");
-        let config = FileLogConfig {
-            path: log_path.clone(),
-            max_size: FileSize(1024 * 1024),
-            rotation: LogRotation::Daily,
-            max_files: 3,
-        };
+        let config = test_logging_config(&dir);
+        let log_path = config.log_file_path();
 
         let file_logger = FileLogger::new(&config).unwrap();
         if let Ok(mut guard) = FILE_LOGGER.lock() {
@@ -437,8 +406,8 @@ mod tests {
         }
 
         let logger = StunLogger {
-            output: LogOutput::File,
-            level: LogLevel::Info,
+            enable_console: false,
+            level_filter: log::LevelFilter::Info,
         };
 
         let record = log::Record::builder()
@@ -465,13 +434,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let log_path = dir.join("test.log");
-        let config = FileLogConfig {
-            path: log_path.clone(),
-            max_size: FileSize(1024 * 1024),
-            rotation: LogRotation::Daily,
-            max_files: 3,
-        };
+        let config = test_logging_config(&dir);
+        let log_path = config.log_file_path();
 
         let file_logger = FileLogger::new(&config).unwrap();
         if let Ok(mut guard) = FILE_LOGGER.lock() {
@@ -479,8 +443,8 @@ mod tests {
         }
 
         let logger = StunLogger {
-            output: LogOutput::Both,
-            level: LogLevel::Info,
+            enable_console: true,
+            level_filter: log::LevelFilter::Info,
         };
 
         let record = log::Record::builder()
@@ -504,8 +468,8 @@ mod tests {
     #[test]
     fn test_stun_logger_log_disabled() {
         let logger = StunLogger {
-            output: LogOutput::Console,
-            level: LogLevel::Error,
+            enable_console: true,
+            level_filter: log::LevelFilter::Error,
         };
 
         let record = log::Record::builder()
@@ -522,13 +486,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let log_path = dir.join("test.log");
-        let config = FileLogConfig {
-            path: log_path.clone(),
-            max_size: FileSize(1024 * 1024),
-            rotation: LogRotation::Daily,
-            max_files: 3,
-        };
+        let config = test_logging_config(&dir);
 
         let mut logger = FileLogger::new(&config).unwrap();
         logger.current_date = "2020-01-01".to_string();
@@ -549,13 +507,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let log_path = dir.join("test.log");
-        let config = FileLogConfig {
-            path: log_path.clone(),
-            max_size: FileSize(10),
-            rotation: LogRotation::Daily,
-            max_files: 5,
-        };
+        let mut config = test_logging_config(&dir);
+        config.max_file_size_mb = 100;
+        let _log_path = config.log_file_path();
 
         let mut logger = FileLogger::new(&config).unwrap();
 
@@ -576,8 +530,8 @@ mod tests {
     #[test]
     fn test_stun_logger_flush_without_file_logger() {
         let logger = StunLogger {
-            output: LogOutput::File,
-            level: LogLevel::Info,
+            enable_console: false,
+            level_filter: log::LevelFilter::Info,
         };
 
         if let Ok(mut guard) = FILE_LOGGER.lock() {

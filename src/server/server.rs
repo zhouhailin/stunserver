@@ -98,7 +98,7 @@ pub async fn run_server(
     config: &ServerConfig,
     state: Arc<ServerState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listen_addr = config.listen;
+    let listen_addr = config.socket_addr()?;
 
     let socket = UdpSocket::bind(listen_addr).await?;
     let socket = Arc::new(socket);

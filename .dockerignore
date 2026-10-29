@@ -1,0 +1,48 @@
+# Docker ignore file for STUN Server
+# Exclude unnecessary files from Docker build context
+
+# Build artifacts
+target/
+debug/
+release/
+*.rs.bk
+*.rlib
+*.prof
+
+# Version control
+.git/
+.gitignore
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Documentation (except README)
+docs/
+specs/
+.qoder/
+.specify/
+*.md
+!README.md
+
+# Test and temporary files
+test-logs/
+test-config/
+dist/
+*.tar.gz
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Coverage and profiling
+coverage/
+*.lcov
+.cargo/

@@ -4,17 +4,16 @@
 //! over a real UDP loopback, and error handling for invalid configurations.
 
 use std::io::Write;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use stun_protocol::{MappedAddress, StunAttributeType, StunMessage, StunMessageType};
-use stunserver::config::{self, LogOutput};
+use stunserver::config;
 use stunserver::server;
 use tempfile::NamedTempFile;
 
-/// Helper: write YAML to a temp file and return its path.
-fn write_temp_config(yaml: &str) -> NamedTempFile {
+/// Helper: write TOML to a temp file and return its path.
+fn write_temp_config(toml_str: &str) -> NamedTempFile {
     let mut f = NamedTempFile::new().expect("create temp file");
-    f.write_all(yaml.as_bytes()).expect("write temp config");
+    f.write_all(toml_str.as_bytes()).expect("write temp config");
     f
 }
 
@@ -24,97 +23,133 @@ fn write_temp_config(yaml: &str) -> NamedTempFile {
 
 #[test]
 fn test_load_config_from_file() {
-    let yaml = r#"
-server:
-  listen: "127.0.0.1:13478"
-logging:
-  level: debug
-  output: console
+    let toml_str = r#"
+[server]
+listen_address = "127.0.0.1"
+port = 13478
+
+[logging]
+level = "debug"
+enable_console = true
 "#;
-    let f = write_temp_config(yaml);
+    let f = write_temp_config(toml_str);
     let cfg = config::load_config(f.path()).unwrap();
-    assert_eq!(
-        cfg.server.listen,
-        "127.0.0.1:13478".parse::<SocketAddr>().unwrap()
-    );
-    assert_eq!(cfg.logging.level.to_string(), "debug");
-    assert_eq!(cfg.logging.output, LogOutput::Console);
+    assert_eq!(cfg.server.listen_address, "127.0.0.1");
+    assert_eq!(cfg.server.port, 13478);
+    assert_eq!(cfg.logging.level, "debug");
+    assert!(cfg.logging.enable_console);
 }
 
 #[test]
 fn test_load_config_file_not_found() {
-    let result = config::load_config(std::path::Path::new("/nonexistent/stunserver.yaml"));
+    let result = config::load_config(std::path::Path::new("/nonexistent/stunserver.toml"));
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("not found"));
 }
 
 #[test]
-fn test_load_config_invalid_yaml() {
-    let yaml = "{{invalid yaml::";
-    let f = write_temp_config(yaml);
+fn test_load_config_invalid_toml() {
+    let toml_str = "{{invalid toml::";
+    let f = write_temp_config(toml_str);
     let result = config::load_config(f.path());
     assert!(result.is_err());
 }
 
 #[test]
 fn test_load_config_invalid_log_level() {
-    let yaml = r#"
-logging:
-  level: verbose
-  output: console
+    let toml_str = r#"
+[logging]
+level = "verbose"
 "#;
-    let f = write_temp_config(yaml);
+    let f = write_temp_config(toml_str);
     let result = config::load_config(f.path());
     assert!(result.is_err());
-}
-
-#[test]
-fn test_load_config_missing_file_section() {
-    let yaml = r#"
-logging:
-  output: file
-"#;
-    let f = write_temp_config(yaml);
-    let result = config::load_config(f.path());
-    // Parses OK but validation should fail.
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("File logging configuration required"));
 }
 
 #[test]
 fn test_load_config_with_file_logging() {
-    let yaml = r#"
-server:
-  listen: "0.0.0.0:3478"
-logging:
-  level: info
-  output: file
-  file:
-    path: "/tmp/stunserver-test.log"
-    max_size: "50MB"
-    rotation: daily
-    max_files: 5
+    let toml_str = r#"
+[server]
+listen_address = "0.0.0.0"
+port = 3478
+
+[logging]
+level = "info"
+log_dir = "/tmp/stunserver-test"
+file_prefix = "test"
+max_file_size_mb = 50
+retention_days = 7
+enable_console = false
 "#;
-    let f = write_temp_config(yaml);
+    let f = write_temp_config(toml_str);
     let cfg = config::load_config(f.path()).unwrap();
-    let file_cfg = cfg.logging.file.unwrap();
-    assert_eq!(file_cfg.path.to_str().unwrap(), "/tmp/stunserver-test.log");
-    assert_eq!(file_cfg.max_size.0, 50 * 1024 * 1024);
-    assert_eq!(file_cfg.max_files, 5);
+    assert_eq!(
+        cfg.logging.log_dir.to_str().unwrap(),
+        "/tmp/stunserver-test"
+    );
+    assert_eq!(cfg.logging.file_prefix, "test");
+    assert_eq!(cfg.logging.max_file_size_mb, 50);
+    assert_eq!(cfg.logging.retention_days, 7);
+    assert!(!cfg.logging.enable_console);
 }
 
 #[test]
 fn test_default_config_values() {
     let cfg = config::default_config();
-    assert_eq!(
-        cfg.server.listen,
-        "0.0.0.0:3478".parse::<SocketAddr>().unwrap()
-    );
-    assert_eq!(cfg.logging.level.to_string(), "info");
+    assert_eq!(cfg.server.listen_address, "0.0.0.0");
+    assert_eq!(cfg.server.port, 3478);
+    assert_eq!(cfg.logging.level, "info");
+}
+
+#[test]
+fn test_load_config_with_network_section() {
+    let toml_str = r#"
+[network]
+udp_recv_buffer_size = 2097152
+udp_send_buffer_size = 2097152
+tcp_connection_timeout_sec = 60
+tcp_idle_timeout_sec = 600
+"#;
+    let f = write_temp_config(toml_str);
+    let cfg = config::load_config(f.path()).unwrap();
+    assert_eq!(cfg.network.udp_recv_buffer_size, 2097152);
+    assert_eq!(cfg.network.udp_send_buffer_size, 2097152);
+    assert_eq!(cfg.network.tcp_connection_timeout_sec, 60);
+    assert_eq!(cfg.network.tcp_idle_timeout_sec, 600);
+}
+
+#[test]
+fn test_load_config_with_security_section() {
+    let toml_str = r#"
+[security]
+enable_tls = false
+"#;
+    let f = write_temp_config(toml_str);
+    let cfg = config::load_config(f.path()).unwrap();
+    assert!(!cfg.security.enable_tls);
+}
+
+#[test]
+fn test_validate_invalid_port() {
+    let toml_str = r#"
+[server]
+port = 0
+"#;
+    let f = write_temp_config(toml_str);
+    let result = config::load_config(f.path());
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_validate_invalid_worker_threads() {
+    let toml_str = r#"
+[server]
+worker_threads = 300
+"#;
+    let f = write_temp_config(toml_str);
+    let result = config::load_config(f.path());
+    assert!(result.is_err());
 }
 
 // -----------------------------------------------------------------------

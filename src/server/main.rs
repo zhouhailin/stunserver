@@ -1,7 +1,7 @@
 //! STUN Server
 //!
 //! High-performance STUN server implementation with async I/O.
-//! Supports YAML configuration files, console and file logging,
+//! Supports TOML configuration files, console and file logging,
 //! and graceful shutdown via SIGINT.
 
 use clap::Parser;
@@ -20,11 +20,11 @@ use stunserver::{config, logging, metadata::BuildMetadata, server};
     before_help = BuildMetadata::capture().format_version_line()
 )]
 struct Args {
-    /// Path to YAML configuration file.
+    /// Path to TOML configuration file.
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Listen address and port (overrides config file).
+    /// Listen address and port (overrides config file, e.g. "0.0.0.0:3478").
     #[arg(short, long)]
     listen: Option<SocketAddr>,
 
@@ -55,12 +55,13 @@ fn main() {
 
     // CLI overrides.
     if let Some(listen) = args.listen {
-        cfg.server.listen = listen;
+        cfg.server.listen_address = listen.ip().to_string();
+        cfg.server.port = listen.port();
     }
 
     // Debug flag overrides log level.
     if args.debug {
-        cfg.logging.level = config::LogLevel::Debug;
+        cfg.logging.level = "debug".to_string();
     }
 
     // Validate final configuration.
@@ -81,7 +82,15 @@ fn main() {
         process::exit(1);
     }
 
-    log::info!("Starting STUN server on {}", cfg.server.listen);
+    let listen_addr = match cfg.server.socket_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("Error: Invalid listen address: {}", e);
+            process::exit(1);
+        }
+    };
+
+    log::info!("Starting STUN server on {}", listen_addr);
 
     // Create server state.
     let state = Arc::new(server::ServerState::new());

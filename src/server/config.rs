@@ -1,12 +1,10 @@
 //! Configuration module for STUN Server.
 //!
-//! Provides YAML-based configuration loading with validation,
+//! Provides TOML-based configuration loading with validation,
 //! custom deserializers for human-readable size formats, and
 //! sensible defaults for all optional fields.
 
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer};
-use std::fmt;
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -14,37 +12,84 @@ use std::path::PathBuf;
 // Default value functions for serde
 // ---------------------------------------------------------------------------
 
-/// Default listen address: all interfaces on STUN port 3478.
-fn default_listen() -> SocketAddr {
-    "0.0.0.0:3478"
-        .parse()
-        .expect("valid default listen address")
+fn default_listen_address() -> String {
+    "0.0.0.0".to_string()
 }
 
-/// Default log level: info.
-fn default_log_level() -> LogLevel {
-    LogLevel::Info
+fn default_port() -> u16 {
+    3478
 }
 
-/// Default log output: both console and file.
-fn default_log_output() -> LogOutput {
-    LogOutput::Both
+fn default_worker_threads() -> usize {
+    0
+}
+
+fn default_max_connections() -> usize {
+    10000
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_dir() -> PathBuf {
+    PathBuf::from("/opt/stunserver/log")
+}
+
+fn default_file_prefix() -> String {
+    "stunserver".to_string()
+}
+
+fn default_max_file_size_mb() -> u64 {
+    100
+}
+
+fn default_retention_days() -> u32 {
+    30
+}
+
+fn default_enable_console() -> bool {
+    true
+}
+
+fn default_udp_recv_buffer_size() -> usize {
+    1048576
+}
+
+fn default_udp_send_buffer_size() -> usize {
+    1048576
+}
+
+fn default_tcp_connection_timeout_sec() -> u64 {
+    30
+}
+
+fn default_tcp_idle_timeout_sec() -> u64 {
+    300
+}
+
+fn default_enable_tls() -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
 // Root configuration
 // ---------------------------------------------------------------------------
 
-/// Top-level configuration containing server and logging sections.
-#[derive(Deserialize, Debug, Clone)]
+/// Top-level configuration containing server, logging, network, and security sections.
+#[derive(Deserialize, Debug, Clone, Default)]
 pub struct Config {
-    /// Server network and operational settings.
     #[serde(default)]
     pub server: ServerConfig,
 
-    /// Logging configuration.
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    #[serde(default)]
+    pub network: NetworkConfig,
+
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,29 +99,35 @@ pub struct Config {
 /// Server network settings.
 #[derive(Deserialize, Debug, Clone)]
 pub struct ServerConfig {
-    /// Listen address and port (e.g. "0.0.0.0:3478").
-    #[serde(
-        default = "default_listen",
-        deserialize_with = "deserialize_socket_addr"
-    )]
-    pub listen: SocketAddr,
+    #[serde(default = "default_listen_address")]
+    pub listen_address: String,
+
+    #[serde(default = "default_port")]
+    pub port: u16,
+
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
+
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: default_listen(),
+            listen_address: default_listen_address(),
+            port: default_port(),
+            worker_threads: default_worker_threads(),
+            max_connections: default_max_connections(),
         }
     }
 }
 
-/// Custom deserializer for SocketAddr from a YAML string.
-fn deserialize_socket_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    s.parse::<SocketAddr>().map_err(de::Error::custom)
+impl ServerConfig {
+    /// Construct a SocketAddr from listen_address and port.
+    pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
+        format!("{}:{}", self.listen_address, self.port).parse()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -86,217 +137,121 @@ where
 /// Logging settings controlling level, output destination, and file rotation.
 #[derive(Deserialize, Debug, Clone)]
 pub struct LoggingConfig {
-    /// Log level filter.
     #[serde(default = "default_log_level")]
-    pub level: LogLevel,
+    pub level: String,
 
-    /// Where log output is sent.
-    #[serde(default = "default_log_output")]
-    pub output: LogOutput,
+    #[serde(default = "default_log_dir")]
+    pub log_dir: PathBuf,
 
-    /// File logging configuration (required when output is "file" or "both").
-    pub file: Option<FileLogConfig>,
+    #[serde(default = "default_file_prefix")]
+    pub file_prefix: String,
+
+    #[serde(default = "default_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+
+    #[serde(default = "default_enable_console")]
+    pub enable_console: bool,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
-            output: default_log_output(),
-            file: Some(FileLogConfig::default()),
+            log_dir: default_log_dir(),
+            file_prefix: default_file_prefix(),
+            max_file_size_mb: default_max_file_size_mb(),
+            retention_days: default_retention_days(),
+            enable_console: default_enable_console(),
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// File logging configuration
-// ---------------------------------------------------------------------------
+impl LoggingConfig {
+    /// Get the log file path.
+    pub fn log_file_path(&self) -> PathBuf {
+        self.log_dir.join(format!("{}.log", self.file_prefix))
+    }
 
-/// File-based logging configuration with rotation support.
-#[derive(Deserialize, Debug, Clone)]
-pub struct FileLogConfig {
-    /// Log file path (absolute or relative).
-    pub path: PathBuf,
+    /// Get max file size in bytes.
+    pub fn max_file_size_bytes(&self) -> u64 {
+        self.max_file_size_mb * 1024 * 1024
+    }
 
-    /// Maximum file size before rotation (e.g. "100MB").
-    pub max_size: FileSize,
+    /// Parse log level string to log::LevelFilter.
+    pub fn level_filter(&self) -> log::LevelFilter {
+        match self.level.to_lowercase().as_str() {
+            "trace" => log::LevelFilter::Trace,
+            "debug" => log::LevelFilter::Debug,
+            "info" => log::LevelFilter::Info,
+            "warn" | "warning" => log::LevelFilter::Warn,
+            "error" => log::LevelFilter::Error,
+            _ => log::LevelFilter::Info,
+        }
+    }
 
-    /// Rotation strategy (currently only "daily" is supported).
-    pub rotation: LogRotation,
-
-    /// Maximum number of rotated log files to retain.
-    pub max_files: u32,
+    /// Determine if file logging is enabled.
+    /// File logging is enabled when console is disabled or when log_dir is explicitly set.
+    pub fn file_logging_enabled(&self) -> bool {
+        // Always enable file logging for now; console output is controlled by enable_console
+        true
+    }
 }
 
-impl Default for FileLogConfig {
+// ---------------------------------------------------------------------------
+// Network configuration
+// ---------------------------------------------------------------------------
+
+/// Network settings for UDP and TCP sockets.
+#[derive(Deserialize, Debug, Clone)]
+pub struct NetworkConfig {
+    #[serde(default = "default_udp_recv_buffer_size")]
+    pub udp_recv_buffer_size: usize,
+
+    #[serde(default = "default_udp_send_buffer_size")]
+    pub udp_send_buffer_size: usize,
+
+    #[serde(default = "default_tcp_connection_timeout_sec")]
+    pub tcp_connection_timeout_sec: u64,
+
+    #[serde(default = "default_tcp_idle_timeout_sec")]
+    pub tcp_idle_timeout_sec: u64,
+}
+
+impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from("/var/log/stunserver/stunserver.log"),
-            max_size: FileSize(100 * 1024 * 1024), // 100 MB
-            rotation: LogRotation::Daily,
-            max_files: 7,
+            udp_recv_buffer_size: default_udp_recv_buffer_size(),
+            udp_send_buffer_size: default_udp_send_buffer_size(),
+            tcp_connection_timeout_sec: default_tcp_connection_timeout_sec(),
+            tcp_idle_timeout_sec: default_tcp_idle_timeout_sec(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Enum types
+// Security configuration
 // ---------------------------------------------------------------------------
 
-/// Log level filter.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
+/// Security settings including TLS configuration (future expansion).
+#[derive(Deserialize, Debug, Clone)]
+pub struct SecurityConfig {
+    #[serde(default = "default_enable_tls")]
+    pub enable_tls: bool,
+
+    pub tls_cert_path: Option<PathBuf>,
+
+    pub tls_key_path: Option<PathBuf>,
 }
 
-impl LogLevel {
-    /// Convert to the `log` crate's LevelFilter.
-    pub fn to_level_filter(self) -> log::LevelFilter {
-        match self {
-            LogLevel::Error => log::LevelFilter::Error,
-            LogLevel::Warn => log::LevelFilter::Warn,
-            LogLevel::Info => log::LevelFilter::Info,
-            LogLevel::Debug => log::LevelFilter::Debug,
-        }
-    }
-}
-
-impl fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LogLevel::Error => write!(f, "error"),
-            LogLevel::Warn => write!(f, "warn"),
-            LogLevel::Info => write!(f, "info"),
-            LogLevel::Debug => write!(f, "debug"),
-        }
-    }
-}
-
-/// Log output destination.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LogOutput {
-    Console,
-    File,
-    Both,
-}
-
-/// Log rotation strategy.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LogRotation {
-    Daily,
-}
-
-// ---------------------------------------------------------------------------
-// FileSize custom type
-// ---------------------------------------------------------------------------
-
-/// A file size in bytes, deserialized from a human-readable string like "100MB".
-///
-/// Supported units: B, KB, MB, GB (powers of 1024).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileSize(pub u64);
-
-impl FileSize {
-    /// Parse a human-readable size string into bytes.
-    pub fn parse(s: &str) -> Result<u64, String> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Err("empty size string".to_string());
-        }
-
-        // Find where the numeric part ends and the unit begins.
-        let unit_start = s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len());
-
-        let (num_part, unit_part) = s.split_at(unit_start);
-        let num_part = num_part.trim();
-        let unit_part = unit_part.trim().to_uppercase();
-
-        if num_part.is_empty() {
-            return Err(format!("missing numeric value in size: '{}'", s));
-        }
-
-        let value: u64 = num_part
-            .parse()
-            .map_err(|e| format!("invalid number in size '{}': {}", s, e))?;
-
-        let multiplier: u64 = match unit_part.as_str() {
-            "B" => 1,
-            "KB" => 1024,
-            "MB" => 1024 * 1024,
-            "GB" => 1024 * 1024 * 1024,
-            "" => 1, // bare number treated as bytes
-            other => {
-                return Err(format!(
-                    "unknown size unit '{}' in '{}'. Valid units: B, KB, MB, GB",
-                    other, s
-                ))
-            }
-        };
-
-        if value == 0 {
-            return Err(format!("size must be > 0, got '{}'", s));
-        }
-
-        Ok(value * multiplier)
-    }
-}
-
-impl<'de> Deserialize<'de> for FileSize {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct FileSizeVisitor;
-
-        impl<'de> Visitor<'de> for FileSizeVisitor {
-            type Value = FileSize;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a file size string like \"100MB\" or a number of bytes")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<FileSize, E>
-            where
-                E: de::Error,
-            {
-                FileSize::parse(value)
-                    .map(FileSize)
-                    .map_err(de::Error::custom)
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<FileSize, E>
-            where
-                E: de::Error,
-            {
-                if value == 0 {
-                    Err(de::Error::custom("size must be > 0"))
-                } else {
-                    Ok(FileSize(value))
-                }
-            }
-        }
-
-        deserializer.deserialize_any(FileSizeVisitor)
-    }
-}
-
-impl fmt::Display for FileSize {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let bytes = self.0;
-        if bytes >= 1024 * 1024 * 1024 && bytes.is_multiple_of(1024 * 1024 * 1024) {
-            write!(f, "{}GB", bytes / (1024 * 1024 * 1024))
-        } else if bytes >= 1024 * 1024 && bytes.is_multiple_of(1024 * 1024) {
-            write!(f, "{}MB", bytes / (1024 * 1024))
-        } else if bytes >= 1024 && bytes.is_multiple_of(1024) {
-            write!(f, "{}KB", bytes / 1024)
-        } else {
-            write!(f, "{}B", bytes)
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            enable_tls: default_enable_tls(),
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -314,26 +269,35 @@ pub enum ConfigError {
     #[error("Failed to read configuration file: {0}")]
     ReadError(#[from] std::io::Error),
 
-    #[error("Invalid YAML syntax: {0}")]
-    YamlError(#[from] serde_yaml::Error),
+    #[error("Invalid TOML syntax: {0}")]
+    TomlError(#[from] toml::de::Error),
 
-    #[error("Invalid logging level: '{0}'. Valid options: error, warn, info, debug")]
+    #[error("Invalid port number: {0}. Must be in range 1-65535")]
+    InvalidPort(u16),
+
+    #[error("Invalid log level: '{0}'. Valid options: trace, debug, info, warn, error")]
     InvalidLogLevel(String),
 
-    #[error("Invalid log output: '{0}'. Valid options: console, file, both")]
-    InvalidLogOutput(String),
+    #[error("Invalid worker threads: {0}. Must be in range 0-256")]
+    InvalidWorkerThreads(usize),
 
-    #[error("File logging configuration required when output is 'file' or 'both'")]
-    MissingFileConfig,
+    #[error("Invalid max connections: {0}. Must be in range 1-1000000")]
+    InvalidMaxConnections(usize),
 
-    #[error("Invalid file size: {0}")]
-    InvalidFileSize(String),
+    #[error("Invalid max file size: {0}. Must be in range 1-10000 MB")]
+    InvalidMaxFileSize(u64),
 
-    #[error("max_files must be > 0")]
-    InvalidMaxFiles,
+    #[error("Invalid retention days: {0}. Must be in range 1-365")]
+    InvalidRetentionDays(u32),
+
+    #[error("TLS enabled but certificate path not provided")]
+    MissingTlsCertPath,
+
+    #[error("TLS enabled but key path not provided")]
+    MissingTlsKeyPath,
 }
 
-/// Load configuration from a YAML file.
+/// Load configuration from a TOML file.
 ///
 /// Returns the parsed and validated `Config`.
 pub fn load_config(path: &std::path::Path) -> Result<Config, ConfigError> {
@@ -342,7 +306,7 @@ pub fn load_config(path: &std::path::Path) -> Result<Config, ConfigError> {
     }
 
     let contents = std::fs::read_to_string(path)?;
-    let config: Config = serde_yaml::from_str(&contents)?;
+    let config: Config = toml::from_str(&contents)?;
 
     validate_config(&config)?;
     Ok(config)
@@ -350,35 +314,55 @@ pub fn load_config(path: &std::path::Path) -> Result<Config, ConfigError> {
 
 /// Build a default configuration (used when no config file is specified).
 pub fn default_config() -> Config {
-    Config {
-        server: ServerConfig::default(),
-        logging: LoggingConfig::default(),
-    }
+    Config::default()
 }
 
 /// Validate a configuration after loading.
 ///
 /// Checks conditional requirements and value constraints.
 pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
-    // If output requires file logging, the file section must be present.
-    match config.logging.output {
-        LogOutput::File | LogOutput::Both => {
-            if config.logging.file.is_none() {
-                return Err(ConfigError::MissingFileConfig);
-            }
-        }
-        LogOutput::Console => {}
+    // Validate server config
+    if config.server.port == 0 {
+        return Err(ConfigError::InvalidPort(config.server.port));
     }
 
-    // Validate file config constraints when present.
-    if let Some(ref file_cfg) = config.logging.file {
-        if file_cfg.max_size.0 == 0 {
-            return Err(ConfigError::InvalidFileSize(
-                "max_size must be > 0".to_string(),
-            ));
+    if config.server.worker_threads > 256 {
+        return Err(ConfigError::InvalidWorkerThreads(
+            config.server.worker_threads,
+        ));
+    }
+
+    if config.server.max_connections == 0 || config.server.max_connections > 1_000_000 {
+        return Err(ConfigError::InvalidMaxConnections(
+            config.server.max_connections,
+        ));
+    }
+
+    // Validate logging config
+    let valid_levels = ["trace", "debug", "info", "warn", "warning", "error"];
+    if !valid_levels.contains(&config.logging.level.to_lowercase().as_str()) {
+        return Err(ConfigError::InvalidLogLevel(config.logging.level.clone()));
+    }
+
+    if config.logging.max_file_size_mb == 0 || config.logging.max_file_size_mb > 10000 {
+        return Err(ConfigError::InvalidMaxFileSize(
+            config.logging.max_file_size_mb,
+        ));
+    }
+
+    if config.logging.retention_days == 0 || config.logging.retention_days > 365 {
+        return Err(ConfigError::InvalidRetentionDays(
+            config.logging.retention_days,
+        ));
+    }
+
+    // Validate security config
+    if config.security.enable_tls {
+        if config.security.tls_cert_path.is_none() {
+            return Err(ConfigError::MissingTlsCertPath);
         }
-        if file_cfg.max_files == 0 {
-            return Err(ConfigError::InvalidMaxFiles);
+        if config.security.tls_key_path.is_none() {
+            return Err(ConfigError::MissingTlsKeyPath);
         }
     }
 
@@ -389,197 +373,238 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
 
-    // --- FileSize parsing tests ---
-
-    #[test]
-    fn test_file_size_parse_bytes() {
-        assert_eq!(FileSize::parse("100B").unwrap(), 100);
-    }
-
-    #[test]
-    fn test_file_size_parse_kb() {
-        assert_eq!(FileSize::parse("500KB").unwrap(), 500 * 1024);
-    }
-
-    #[test]
-    fn test_file_size_parse_mb() {
-        assert_eq!(FileSize::parse("100MB").unwrap(), 100 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_file_size_parse_gb() {
-        assert_eq!(FileSize::parse("1GB").unwrap(), 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_file_size_parse_case_insensitive() {
-        assert_eq!(FileSize::parse("100mb").unwrap(), 100 * 1024 * 1024);
-        assert_eq!(FileSize::parse("1gb").unwrap(), 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_file_size_parse_zero_rejected() {
-        assert!(FileSize::parse("0MB").is_err());
-    }
-
-    #[test]
-    fn test_file_size_parse_empty_rejected() {
-        assert!(FileSize::parse("").is_err());
-    }
-
-    #[test]
-    fn test_file_size_parse_invalid_unit() {
-        assert!(FileSize::parse("100TB").is_err());
-    }
-
-    #[test]
-    fn test_file_size_display() {
-        assert_eq!(format!("{}", FileSize(100)), "100B");
-        assert_eq!(format!("{}", FileSize(1024)), "1KB");
-        assert_eq!(format!("{}", FileSize(100 * 1024 * 1024)), "100MB");
-        assert_eq!(format!("{}", FileSize(2 * 1024 * 1024 * 1024)), "2GB");
-    }
-
     // --- Config deserialization tests ---
 
     #[test]
     fn test_deserialize_minimal_config() {
-        let yaml = "";
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(
-            config.server.listen,
-            "0.0.0.0:3478".parse::<SocketAddr>().unwrap()
-        );
-        assert_eq!(config.logging.level, LogLevel::Info);
-        assert_eq!(config.logging.output, LogOutput::Both);
+        let toml_str = "";
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.listen_address, "0.0.0.0");
+        assert_eq!(config.server.port, 3478);
+        assert_eq!(config.logging.level, "info");
+        assert!(config.logging.enable_console);
     }
 
     #[test]
     fn test_deserialize_server_only() {
-        let yaml = r#"
-server:
-  listen: "127.0.0.1:8080"
+        let toml_str = r#"
+[server]
+listen_address = "127.0.0.1"
+port = 8080
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(
-            config.server.listen,
-            "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
-        );
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.listen_address, "127.0.0.1");
+        assert_eq!(config.server.port, 8080);
     }
 
     #[test]
     fn test_deserialize_full_config() {
-        let yaml = r#"
-server:
-  listen: "0.0.0.0:3478"
-logging:
-  level: debug
-  output: file
-  file:
-    path: "/var/log/stunserver/test.log"
-    max_size: "50MB"
-    rotation: daily
-    max_files: 3
+        let toml_str = r#"
+[server]
+listen_address = "0.0.0.0"
+port = 3478
+worker_threads = 4
+max_connections = 5000
+
+[logging]
+level = "debug"
+log_dir = "/var/log/stunserver"
+file_prefix = "test"
+max_file_size_mb = 50
+retention_days = 7
+enable_console = false
+
+[network]
+udp_recv_buffer_size = 2097152
+udp_send_buffer_size = 2097152
+tcp_connection_timeout_sec = 60
+tcp_idle_timeout_sec = 600
+
+[security]
+enable_tls = false
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.logging.level, LogLevel::Debug);
-        assert_eq!(config.logging.output, LogOutput::File);
-        let file_cfg = config.logging.file.unwrap();
-        assert_eq!(file_cfg.path, PathBuf::from("/var/log/stunserver/test.log"));
-        assert_eq!(file_cfg.max_size.0, 50 * 1024 * 1024);
-        assert_eq!(file_cfg.rotation, LogRotation::Daily);
-        assert_eq!(file_cfg.max_files, 3);
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.port, 3478);
+        assert_eq!(config.server.worker_threads, 4);
+        assert_eq!(config.server.max_connections, 5000);
+        assert_eq!(config.logging.level, "debug");
+        assert_eq!(config.logging.log_dir, PathBuf::from("/var/log/stunserver"));
+        assert_eq!(config.logging.file_prefix, "test");
+        assert_eq!(config.logging.max_file_size_mb, 50);
+        assert_eq!(config.logging.retention_days, 7);
+        assert!(!config.logging.enable_console);
+        assert_eq!(config.network.udp_recv_buffer_size, 2097152);
+        assert_eq!(config.network.tcp_connection_timeout_sec, 60);
+        assert!(!config.security.enable_tls);
     }
 
     #[test]
-    fn test_deserialize_console_only() {
-        let yaml = r#"
-logging:
-  level: debug
-  output: console
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.logging.output, LogOutput::Console);
-        assert!(config.logging.file.is_none());
+    fn test_server_config_socket_addr() {
+        let config = ServerConfig {
+            listen_address: "192.168.1.1".to_string(),
+            port: 8080,
+            worker_threads: 0,
+            max_connections: 10000,
+        };
+        let addr = config.socket_addr().unwrap();
+        assert_eq!(addr, "192.168.1.1:8080".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_logging_config_log_file_path() {
+        let config = LoggingConfig {
+            level: "info".to_string(),
+            log_dir: PathBuf::from("/var/log/stunserver"),
+            file_prefix: "test".to_string(),
+            max_file_size_mb: 100,
+            retention_days: 30,
+            enable_console: true,
+        };
+        assert_eq!(
+            config.log_file_path(),
+            PathBuf::from("/var/log/stunserver/test.log")
+        );
+    }
+
+    #[test]
+    fn test_logging_config_max_file_size_bytes() {
+        let config = LoggingConfig {
+            level: "info".to_string(),
+            log_dir: PathBuf::from("/var/log"),
+            file_prefix: "stunserver".to_string(),
+            max_file_size_mb: 100,
+            retention_days: 30,
+            enable_console: true,
+        };
+        assert_eq!(config.max_file_size_bytes(), 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_logging_config_level_filter() {
+        let mut config = LoggingConfig::default();
+
+        config.level = "trace".to_string();
+        assert_eq!(config.level_filter(), log::LevelFilter::Trace);
+
+        config.level = "debug".to_string();
+        assert_eq!(config.level_filter(), log::LevelFilter::Debug);
+
+        config.level = "info".to_string();
+        assert_eq!(config.level_filter(), log::LevelFilter::Info);
+
+        config.level = "warn".to_string();
+        assert_eq!(config.level_filter(), log::LevelFilter::Warn);
+
+        config.level = "error".to_string();
+        assert_eq!(config.level_filter(), log::LevelFilter::Error);
+
+        config.level = "invalid".to_string();
+        assert_eq!(config.level_filter(), log::LevelFilter::Info);
     }
 
     // --- Validation tests ---
 
     #[test]
-    fn test_validate_missing_file_config_for_file_output() {
-        let config = Config {
-            server: ServerConfig::default(),
-            logging: LoggingConfig {
-                level: LogLevel::Info,
-                output: LogOutput::File,
-                file: None,
-            },
-        };
-        let err = validate_config(&config).unwrap_err();
-        assert!(matches!(err, ConfigError::MissingFileConfig));
-    }
-
-    #[test]
-    fn test_validate_missing_file_config_for_both_output() {
-        let config = Config {
-            server: ServerConfig::default(),
-            logging: LoggingConfig {
-                level: LogLevel::Info,
-                output: LogOutput::Both,
-                file: None,
-            },
-        };
-        let err = validate_config(&config).unwrap_err();
-        assert!(matches!(err, ConfigError::MissingFileConfig));
-    }
-
-    #[test]
-    fn test_validate_console_without_file_config_ok() {
-        let config = Config {
-            server: ServerConfig::default(),
-            logging: LoggingConfig {
-                level: LogLevel::Info,
-                output: LogOutput::Console,
-                file: None,
-            },
-        };
+    fn test_validate_valid_config() {
+        let config = Config::default();
         assert!(validate_config(&config).is_ok());
     }
 
     #[test]
-    fn test_validate_zero_max_files() {
-        let config = Config {
-            server: ServerConfig::default(),
-            logging: LoggingConfig {
-                level: LogLevel::Info,
-                output: LogOutput::File,
-                file: Some(FileLogConfig {
-                    path: PathBuf::from("/tmp/test.log"),
-                    max_size: FileSize(1024),
-                    rotation: LogRotation::Daily,
-                    max_files: 0,
-                }),
-            },
-        };
+    fn test_validate_invalid_port_zero() {
+        let mut config = Config::default();
+        config.server.port = 0;
         let err = validate_config(&config).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidMaxFiles));
+        assert!(matches!(err, ConfigError::InvalidPort(0)));
     }
 
     #[test]
-    fn test_validate_valid_config() {
-        let config = Config {
-            server: ServerConfig::default(),
-            logging: LoggingConfig {
-                level: LogLevel::Info,
-                output: LogOutput::File,
-                file: Some(FileLogConfig {
-                    path: PathBuf::from("/tmp/test.log"),
-                    max_size: FileSize(100 * 1024 * 1024),
-                    rotation: LogRotation::Daily,
-                    max_files: 7,
-                }),
-            },
-        };
+    fn test_validate_invalid_worker_threads() {
+        let mut config = Config::default();
+        config.server.worker_threads = 300;
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidWorkerThreads(300)));
+    }
+
+    #[test]
+    fn test_validate_invalid_max_connections_zero() {
+        let mut config = Config::default();
+        config.server.max_connections = 0;
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidMaxConnections(0)));
+    }
+
+    #[test]
+    fn test_validate_invalid_max_connections_too_large() {
+        let mut config = Config::default();
+        config.server.max_connections = 2_000_000;
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidMaxConnections(2_000_000)));
+    }
+
+    #[test]
+    fn test_validate_invalid_log_level() {
+        let mut config = Config::default();
+        config.logging.level = "invalid".to_string();
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidLogLevel(_)));
+    }
+
+    #[test]
+    fn test_validate_invalid_max_file_size_zero() {
+        let mut config = Config::default();
+        config.logging.max_file_size_mb = 0;
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidMaxFileSize(0)));
+    }
+
+    #[test]
+    fn test_validate_invalid_max_file_size_too_large() {
+        let mut config = Config::default();
+        config.logging.max_file_size_mb = 20000;
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidMaxFileSize(20000)));
+    }
+
+    #[test]
+    fn test_validate_invalid_retention_days_zero() {
+        let mut config = Config::default();
+        config.logging.retention_days = 0;
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRetentionDays(0)));
+    }
+
+    #[test]
+    fn test_validate_invalid_retention_days_too_large() {
+        let mut config = Config::default();
+        config.logging.retention_days = 400;
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRetentionDays(400)));
+    }
+
+    #[test]
+    fn test_validate_tls_enabled_without_cert() {
+        let mut config = Config::default();
+        config.security.enable_tls = true;
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::MissingTlsCertPath));
+    }
+
+    #[test]
+    fn test_validate_tls_enabled_without_key() {
+        let mut config = Config::default();
+        config.security.enable_tls = true;
+        config.security.tls_cert_path = Some(PathBuf::from("/path/to/cert.pem"));
+        let err = validate_config(&config).unwrap_err();
+        assert!(matches!(err, ConfigError::MissingTlsKeyPath));
+    }
+
+    #[test]
+    fn test_validate_tls_enabled_with_both_paths() {
+        let mut config = Config::default();
+        config.security.enable_tls = true;
+        config.security.tls_cert_path = Some(PathBuf::from("/path/to/cert.pem"));
+        config.security.tls_key_path = Some(PathBuf::from("/path/to/key.pem"));
         assert!(validate_config(&config).is_ok());
     }
 
@@ -587,7 +612,7 @@ logging:
 
     #[test]
     fn test_load_config_file_not_found() {
-        let err = load_config(std::path::Path::new("/nonexistent/config.yaml")).unwrap_err();
+        let err = load_config(std::path::Path::new("/nonexistent/config.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::FileNotFound(_)));
     }
 
@@ -597,21 +622,20 @@ logging:
         assert!(validate_config(&config).is_ok());
     }
 
-    // --- LogLevel tests ---
-
     #[test]
-    fn test_log_level_display() {
-        assert_eq!(LogLevel::Error.to_string(), "error");
-        assert_eq!(LogLevel::Warn.to_string(), "warn");
-        assert_eq!(LogLevel::Info.to_string(), "info");
-        assert_eq!(LogLevel::Debug.to_string(), "debug");
+    fn test_network_config_defaults() {
+        let config = NetworkConfig::default();
+        assert_eq!(config.udp_recv_buffer_size, 1048576);
+        assert_eq!(config.udp_send_buffer_size, 1048576);
+        assert_eq!(config.tcp_connection_timeout_sec, 30);
+        assert_eq!(config.tcp_idle_timeout_sec, 300);
     }
 
     #[test]
-    fn test_log_level_to_level_filter() {
-        assert_eq!(LogLevel::Error.to_level_filter(), log::LevelFilter::Error);
-        assert_eq!(LogLevel::Warn.to_level_filter(), log::LevelFilter::Warn);
-        assert_eq!(LogLevel::Info.to_level_filter(), log::LevelFilter::Info);
-        assert_eq!(LogLevel::Debug.to_level_filter(), log::LevelFilter::Debug);
+    fn test_security_config_defaults() {
+        let config = SecurityConfig::default();
+        assert!(!config.enable_tls);
+        assert!(config.tls_cert_path.is_none());
+        assert!(config.tls_key_path.is_none());
     }
 }

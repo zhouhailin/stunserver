@@ -1,181 +1,263 @@
 # STUN Server
 
-High-performance STUN (Session Traversal Utilities for NAT) server implementation in Rust, RFC 5389 compliant.
+A high-performance STUN (Session Traversal Utilities for NAT) server implementation in Rust, compliant with RFC 5389.
 
-[![CI](https://github.com/yourusername/stunserver/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/stunserver/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/yourusername/stunserver/branch/main/graph/badge.svg)](https://codecov.io/gh/yourusername/stunserver)
+[中文文档](README.zh-CN.md)
 
 ## Features
 
-- **High Performance**: Async I/O with Tokio, supports 10,000+ QPS
-- **RFC 5389 Compliant**: Full STUN protocol implementation
-- **Dual-Stack**: IPv4 and IPv6 support
-- **Flexible Configuration**: YAML config files with sensible defaults
-- **Production Ready**: systemd integration, file logging with rotation
-- **Cross-Platform**: Linux, macOS, Windows support
-
-## Components
-
-This workspace contains three executables:
-
-- **stunserver**: High-performance STUN server
-- **stunclient**: Command-line STUN client for testing
-- **stunbench**: Benchmark tool for performance testing
+- 🚀 **High Performance**: Built with Rust and Tokio for async I/O
+- 🔒 **RFC 5389 Compliant**: Full STUN protocol implementation
+- 📦 **Easy Deployment**: Standardized packaging with systemd integration
+- 🐳 **Docker Support**: Multi-stage builds with minimal image size
+- 🔄 **CI/CD Ready**: GitHub Actions workflow for automated builds
+- 📝 **Comprehensive Logging**: Built-in log rotation and management
 
 ## Quick Start
+
+### Prerequisites
+
+- Rust 1.75+ (for building from source)
+- Linux system with systemd (for deployment)
+- Docker 20.10+ (for container deployment)
 
 ### Build from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/stunserver.git
+git clone https://github.com/zhouhailin/stunserver.git
 cd stunserver
 
-# Build all executables
-cargo build --release
+# Build release binary
+make build
 
 # Run tests
-cargo test --all
+make test
+
+# Create distribution package
+make package
 ```
 
-### Run the Server
+### Installation (Linux with systemd)
 
 ```bash
-# Start with default configuration (0.0.0.0:3478)
-./target/release/stunserver
+# Build first
+make build
 
-# Start with custom configuration
-./target/release/stunserver --config config/example.yaml
+# Install (requires root)
+cd deploy
+sudo make install
 
-# Start on custom port
-./target/release/stunserver --listen 0.0.0.0:8080
+# Start the service
+sudo make start
+
+# Check status
+sudo make status
 ```
 
-### Test with Client
+### Docker Deployment
 
 ```bash
-# Send a binding request with IP and port
-./target/release/stunclient 127.0.0.1:3478
+# Build Docker image
+docker build -t stunserver:latest -f docker/Dockerfile .
 
-# Send a binding request with IP only (defaults to port 3478)
-./target/release/stunclient 127.0.0.1
-
-# Send a binding request with domain name (DNS resolution, defaults to port 3478)
-./target/release/stunclient stunserver2025.stunprotocol.org
-
-# Send a binding request with domain name and explicit port
-./target/release/stunclient stunserver2025.stunprotocol.org:3478
-
-# With custom timeout
-./target/release/stunclient --timeout 10 127.0.0.1:3478
-```
-
-The client supports:
-- **IPv4 addresses**: `192.168.1.1` or `192.168.1.1:3478`
-- **IPv6 addresses**: `[::1]` or `[::1]:3478`
-- **Domain names**: `example.com` or `example.com:3478`
-- **Default port**: 3478 (STUN standard port) when not specified
-- **DNS resolution**: Automatically resolves domain names with fallback support
-- **Quiet mode**: Use `--quiet` to suppress startup log
-
-### Run Benchmark
-
-```bash
-# Benchmark at 10,000 QPS for 60 seconds
-./target/release/stunbench --qps 10000 127.0.0.1:3478
-
-# Benchmark with specific request count
-./target/release/stunbench --qps 10000 --requests 100000 127.0.0.1:3478
+# Run container
+docker run -d \
+  --name stunserver \
+  -p 3478:3478/udp \
+  -p 3478:3478/tcp \
+  -v $(pwd)/logs:/opt/stunserver/log \
+  stunserver:latest
 ```
 
 ## Configuration
 
-The server supports YAML configuration files. See `config/example.yaml` for a complete example.
+The server uses a TOML configuration file located at `/opt/stunserver/etc/stunserver.conf`.
 
-### Minimal Configuration
+### Example Configuration
 
-```yaml
-server:
-  listen: "0.0.0.0:3478"
+```toml
+[server]
+listen_address = "0.0.0.0"
+port = 3478
+worker_threads = 0  # 0 = auto-detect CPU cores
+max_connections = 10000
 
-logging:
-  level: info
-  output: console
+[logging]
+level = "info"
+log_dir = "/opt/stunserver/log"
+file_prefix = "stunserver"
+max_file_size_mb = 100
+retention_days = 30
+enable_console = true
+
+[network]
+udp_recv_buffer_size = 1048576
+udp_send_buffer_size = 1048576
+tcp_connection_timeout_sec = 30
+tcp_idle_timeout_sec = 300
 ```
 
-### Production Configuration
+### Environment Variables (Docker)
 
-```yaml
-server:
-  listen: "0.0.0.0:3478"
+When running in Docker, you can override configuration with environment variables:
 
-logging:
-  level: info
-  output: file
-  file:
-    path: "/var/log/stunserver/stunserver.log"
-    max_size: "100MB"
-    rotation: daily
-    max_files: 7
+- `STUN_CONFIG_PATH`: Configuration file path (default: `/opt/stunserver/etc/stunserver.conf`)
+- `STUN_LOG_LEVEL`: Log level (trace, debug, info, warn, error)
+- `STUN_PORT`: Listening port (default: 3478)
+- `STUN_LISTEN_ADDRESS`: Listen address (default: 0.0.0.0)
+
+## Directory Structure
+
+After installation, the server uses the following directory structure:
+
+```
+/opt/stunserver/
+├── bin/
+│   └── stunserver              # Binary executable
+├── etc/
+│   └── stunserver.conf         # Configuration file
+└── log/
+    ├── stunserver.log          # Current log file
+    └── stunserver.log.1        # Rotated log files
 ```
 
-## Systemd Integration
+## Management Commands
 
-Install the systemd service for production deployments:
+### Development Commands (Root Makefile)
 
 ```bash
-# Copy service file
-sudo cp systemd/stunserver.service /etc/systemd/system/
+make build      # Build release binary
+make test       # Run all tests
+make package    # Create distribution package
+make clean      # Clean build artifacts
+make fmt        # Format code
+make lint       # Run clippy lints
+make help       # Show help
+```
 
-# Copy configuration
-sudo mkdir -p /etc/stunserver
-sudo cp config/example.yaml /etc/stunserver/config.yaml
+### Deployment Commands (deploy/Makefile)
 
-# Enable and start service
-sudo systemctl daemon-reload
-sudo systemctl enable stunserver
-sudo systemctl start stunserver
+```bash
+sudo make install      # Install and enable service
+sudo make uninstall    # Remove service and files
+sudo make start        # Start service
+sudo make stop         # Stop service
+sudo make restart      # Restart service
+sudo make status       # Show service status
+sudo make help         # Show help
+```
 
-# Check status
+## Docker Images
+
+### Automated Builds
+
+Docker images are automatically built and published to GitHub Container Registry (ghcr.io) via GitHub Actions:
+
+- **Latest**: `ghcr.io/zhouhailin/stunserver:latest` (from main branch)
+- **Version tags**: `ghcr.io/zhouhailin/stunserver:v0.1.1` (from releases)
+
+### Pull and Run
+
+```bash
+# Pull latest image
+docker pull ghcr.io/zhouhailin/stunserver:latest
+
+# Run with custom configuration
+docker run -d \
+  --name stunserver \
+  -p 3478:3478/udp \
+  -p 3478:3478/tcp \
+  -v $(pwd)/config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro \
+  -v $(pwd)/logs:/opt/stunserver/log \
+  ghcr.io/zhouhailin/stunserver:latest
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+
+services:
+  stunserver:
+    image: ghcr.io/zhouhailin/stunserver:latest
+    container_name: stunserver
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+    volumes:
+      - ./config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro
+      - ./logs:/opt/stunserver/log
+    environment:
+      - STUN_LOG_LEVEL=info
+    restart: unless-stopped
+```
+
+## Log Rotation
+
+The server includes built-in log rotation with the following features:
+
+- **Size-based rotation**: Logs rotate when reaching 100MB (configurable)
+- **Time-based rotation**: Daily rotation at midnight
+- **Retention**: Keeps logs for 30 days (configurable)
+- **Automatic cleanup**: Old logs are automatically deleted
+
+Log files are named:
+- `stunserver.log` - Current active log
+- `stunserver.log.1` - Most recent rotated log
+- `stunserver.log.2` - Older rotated log
+- ...
+
+## Troubleshooting
+
+### Service won't start
+
+```bash
+# Check service status
 sudo systemctl status stunserver
+
+# View logs
+sudo journalctl -u stunserver -n 50
+
+# Check configuration
+cat /opt/stunserver/etc/stunserver.conf
 ```
 
-## Build Metadata
-
-All executables display build metadata at startup in a concise, machine-readable format:
-
-```
-stunserver v0.1.0 commit=14991861ab505fc80ce23b5ad3651349ba138299 compiled=2026-10-29T18:59:21+08:00 started=2026-10-29T19:01:24+08:00
-```
-
-This includes:
-- Application name and version (from Cargo.toml)
-- Git commit ID (full 40-character hash)
-- Compilation timestamp (RFC 3339 format with local timezone)
-- Startup timestamp (RFC 3339 format with local timezone)
-- "-dirty" suffix appended to version if uncommitted changes exist
-
-Use `--quiet` flag to suppress startup log output.
-
-### Version Information
-
-All executables display version information in `--help` output:
+### Port already in use
 
 ```bash
-$ ./target/release/stunserver --help
-stunserver 0.1.0-dirty (commit 14991861ab505fc80ce23b5ad3651349ba138299, compiled 2026-10-29T18:59:21+08:00)
+# Check what's using port 3478
+sudo netstat -tulnp | grep 3478
 
-High-performance STUN server
+# Change port in configuration
+sudo vim /opt/stunserver/etc/stunserver.conf
+# Modify: port = 3479
 
-Usage: stunserver [OPTIONS]
-...
+# Restart service
+sudo make restart
 ```
 
-The `--version` flag also outputs version information:
+### Permission denied
 
 ```bash
-$ ./target/release/stunserver --version
-stunserver 0.1.0
+# Ensure correct ownership
+sudo chown -R stunserver:stunserver /opt/stunserver
+
+# Check file permissions
+ls -la /opt/stunserver/
+```
+
+### Docker container issues
+
+```bash
+# View container logs
+docker logs stunserver
+
+# Check container status
+docker ps -a | grep stunserver
+
+# Restart container
+docker restart stunserver
 ```
 
 ## Development
@@ -184,68 +266,61 @@ stunserver 0.1.0
 
 ```
 stunserver/
-├── crates/
-│   └── stun-protocol/  # STUN protocol library
 ├── src/
-│   ├── server/         # STUN server binary
-│   ├── client/         # STUN client binary
-│   └── bench/          # Benchmark tool binary
-├── config/             # Example configurations
-├── systemd/            # systemd service files
+│   ├── server/         # STUN server implementation
+│   ├── client/         # STUN client implementation
+│   └── bench/          # Benchmarking tools
+├── crates/
+│   └── stun-protocol/  # Protocol implementation
+├── deploy/             # Deployment scripts
+├── docker/             # Docker files
+├── systemd/            # Systemd service file
 └── .github/workflows/  # CI/CD workflows
 ```
 
-### Testing
+### Running Tests
 
 ```bash
 # Run all tests
-cargo test --all
+cargo test
 
-# Run with coverage (requires cargo-tarpaulin)
-cargo tarpaulin --all
+# Run with output
+cargo test -- --nocapture
 
-# Check formatting
-cargo fmt --all -- --check
-
-# Run linter
-cargo clippy --all-targets --all-features -- -D warnings
+# Run specific test
+cargo test test_name
 ```
 
-### Code Coverage
-
-The project maintains 95%+ test coverage. Coverage reports are generated automatically in CI.
-
-## Documentation
-
-- [Release Process](docs/release.md)
-- [Build Metadata](docs/build-metadata.md)
-- [Configuration Reference](config/example.yaml)
-
-## Performance
-
-The server is designed for high performance:
-
-- **Target**: 10,000+ QPS
-- **Latency**: < 1ms p99 (local network)
-- **Memory**: Minimal footprint with pre-allocated buffers
-- **Concurrency**: Async I/O with Tokio runtime
-
-Run the benchmark tool to test performance on your system:
+### Code Quality
 
 ```bash
-./target/release/stunbench --qps 10000 --duration 60 127.0.0.1:3478
+# Format code
+cargo fmt --all
+
+# Run lints
+cargo clippy -- -D warnings
+
+# Check formatting
+cargo fmt -- --check
 ```
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow and guidelines.
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch
+3. Write tests for new functionality
+4. Ensure all tests pass
+5. Run `cargo fmt` and `cargo clippy`
+6. Submit a pull request
 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Acknowledgments
+## Links
 
-- RFC 5389: Session Traversal Utilities for NAT (STUN)
-- Tokio: Async runtime for Rust
-- The Rust community for excellent tooling and libraries
+- **Repository**: https://github.com/zhouhailin/stunserver
+- **Issues**: https://github.com/zhouhailin/stunserver/issues
+- **RFC 5389**: https://tools.ietf.org/html/rfc5389
