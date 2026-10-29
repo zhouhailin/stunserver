@@ -242,8 +242,8 @@ fn test_rfc5769_attribute_padding() {
         );
 
         // Verify padding bytes are zero
-        for i in (4 + len)..padded_len {
-            assert_eq!(encoded[i], 0, "Padding byte at position {} must be zero", i);
+        for (i, byte) in encoded.iter().enumerate().take(padded_len).skip(4 + len) {
+            assert_eq!(*byte, 0, "Padding byte at position {} must be zero", i);
         }
     }
 }

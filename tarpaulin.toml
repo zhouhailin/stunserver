@@ -1,6 +1,16 @@
 [all]
 exclude-files = [
-    "stunbench/src/main.rs",
-    "stunclient/src/main.rs",
-    "stunserver/src/main.rs",
+    # Main executables (CLI entry points)
+    "src/server/main.rs",
+    "src/client/main.rs",
+    "src/bench/main.rs",
+    # Build scripts
+    "src/server/build.rs",
+    "src/client/build.rs",
+    "src/bench/build.rs",
+    "build.rs",
+    # Metadata modules (build-time info)
+    "src/server/metadata.rs",
+    "src/client/metadata.rs",
+    "src/bench/metadata.rs",
 ]
