@@ -8,7 +8,10 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stun_protocol::{describe_message, StunMessage, StunMessageType};
+use stun_protocol::integrity;
+use stun_protocol::{
+    describe_message, StunAttribute, StunAttributeType, StunMessage, StunMessageType,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
@@ -23,6 +26,29 @@ pub struct BenchConfig {
     pub duration: Option<Duration>,
     /// Total request count (if specified, alternative to duration).
     pub request_count: Option<u64>,
+    /// Append a terminal FINGERPRINT to every request.
+    pub fingerprint: bool,
+}
+
+/// Build a Binding Request, optionally with a valid terminal FINGERPRINT.
+pub fn build_request(transaction_id: [u8; 12], fingerprint: bool) -> (StunMessage, Vec<u8>) {
+    let mut request = StunMessage::new(StunMessageType::Request, transaction_id);
+    if !fingerprint {
+        let bytes = request.encode();
+        return (request, bytes);
+    }
+
+    request.add_attribute(StunAttribute::new(
+        StunAttributeType::Fingerprint,
+        vec![0u8; 4],
+    ));
+    let fp_offset = request
+        .attribute_offset(StunAttributeType::Fingerprint as u16)
+        .expect("FINGERPRINT was just added");
+    let mut bytes = request.encode();
+    let crc = integrity::fingerprint(&bytes[..fp_offset]);
+    bytes[fp_offset + 4..fp_offset + 8].copy_from_slice(&crc.to_be_bytes());
+    (request, bytes)
 }
 
 /// Run a benchmark against the specified STUN server.
@@ -84,6 +110,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<BenchmarkStats, Strin
     let sender_stop_signal = stop_signal;
     let sender_server_addrs = config.server_addrs.clone();
     let sender_addr_idx = current_addr_idx.clone();
+    let sender_fingerprint = config.fingerprint;
     let sender_handle = tokio::spawn(async move {
         let interval_duration = if sender_target_qps > 0 {
             Duration::from_micros(1_000_000 / sender_target_qps as u64)
@@ -113,8 +140,7 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<BenchmarkStats, Strin
 
             // Build and send STUN request.
             let transaction_id = generate_transaction_id();
-            let request = StunMessage::new(StunMessageType::Request, transaction_id);
-            let request_bytes = request.encode();
+            let (request, request_bytes) = build_request(transaction_id, sender_fingerprint);
 
             log::debug!("Sending: {}", describe_message(&request));
             log::trace!("Sending: {:02x?}", request_bytes);
@@ -342,6 +368,7 @@ mod tests {
             target_qps: 1000,
             duration: Some(Duration::from_secs(60)),
             request_count: None,
+            fingerprint: false,
         };
         assert_eq!(config.target_qps, 1000);
         assert!(config.duration.is_some());
@@ -363,6 +390,7 @@ mod tests {
             target_qps: 100,
             duration: None,
             request_count: None,
+            fingerprint: false,
         };
         let result = run_benchmark(&config).await;
         assert!(result.is_err());

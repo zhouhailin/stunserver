@@ -377,3 +377,74 @@ fn test_rfc5769_address_family_encoding() {
     let decoded = MappedAddress::decode(&encoded).expect("Failed to decode IPv6");
     assert_eq!(decoded.family, AddressFamily::IPv6);
 }
+
+/// RFC 5769 sections 2.1-2.3 use the short-term password
+/// "VOkJxbRl1RmTxUk/WvJxBt". MESSAGE-INTEGRITY and FINGERPRINT must verify
+/// against every published vector.
+#[test]
+fn test_rfc5769_short_term_integrity_and_fingerprint() {
+    use stun_protocol::integrity::short_term_key;
+
+    let key = short_term_key("VOkJxbRl1RmTxUk/WvJxBt");
+    for (name, vector) in [
+        ("2.1 request", &SAMPLE_REQUEST[..]),
+        ("2.2 IPv4 response", &SAMPLE_IPV4_RESPONSE[..]),
+        ("2.3 IPv6 response", &SAMPLE_IPV6_RESPONSE[..]),
+    ] {
+        assert!(
+            StunMessage::verify_message_integrity(vector, &key),
+            "{name}: MESSAGE-INTEGRITY must match the documented digest"
+        );
+        assert!(
+            StunMessage::verify_message_fingerprint(vector),
+            "{name}: FINGERPRINT must match the documented CRC-32"
+        );
+    }
+}
+
+/// Tampering any byte covered by MESSAGE-INTEGRITY must break both the digest
+/// and the FINGERPRINT; tampering only the FINGERPRINT must leave the digest
+/// intact.
+#[test]
+fn test_rfc5769_tampering_is_detected() {
+    use stun_protocol::integrity::short_term_key;
+
+    let key = short_term_key("VOkJxbRl1RmTxUk/WvJxBt");
+
+    // Byte 44 is inside XOR-MAPPED-ADDRESS, covered by both attributes.
+    let mut covered = SAMPLE_IPV4_RESPONSE;
+    covered[44] ^= 0x01;
+    assert!(!StunMessage::verify_message_integrity(&covered, &key));
+    assert!(!StunMessage::verify_message_fingerprint(&covered));
+
+    // The final byte is the FINGERPRINT value, outside the digest range.
+    let mut fingerprint_only = SAMPLE_IPV4_RESPONSE;
+    let last = fingerprint_only.len() - 1;
+    fingerprint_only[last] ^= 0x01;
+    assert!(StunMessage::verify_message_integrity(
+        &fingerprint_only,
+        &key
+    ));
+    assert!(!StunMessage::verify_message_fingerprint(&fingerprint_only));
+}
+
+/// RFC 5769 section 2.4 uses long-term credentials: username "マトリックス",
+/// realm "example.org", password "TheMatrIX". The derived MD5 key must verify
+/// the published MESSAGE-INTEGRITY.
+#[test]
+fn test_rfc5769_long_term_key_verifies_integrity() {
+    use stun_protocol::integrity::long_term_key;
+
+    let key =
+        long_term_key("マトリックス", "example.org", "TheMatrIX").expect("derive long-term key");
+    assert_eq!(key.len(), 16);
+
+    assert!(StunMessage::verify_message_integrity(
+        &SAMPLE_LONG_TERM_REQUEST,
+        &key
+    ));
+
+    let mut tampered = SAMPLE_LONG_TERM_REQUEST;
+    tampered[28] ^= 0x01; // inside the USERNAME value
+    assert!(!StunMessage::verify_message_integrity(&tampered, &key));
+}

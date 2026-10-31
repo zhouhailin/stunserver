@@ -5,6 +5,8 @@
 //! sensible defaults for all optional fields.
 
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -76,6 +78,10 @@ fn default_enable_tls() -> bool {
     false
 }
 
+fn default_nonce_lifetime_sec() -> u64 {
+    600
+}
+
 // ---------------------------------------------------------------------------
 // Root configuration
 // ---------------------------------------------------------------------------
@@ -94,6 +100,9 @@ pub struct Config {
 
     #[serde(default)]
     pub security: SecurityConfig,
+
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +274,188 @@ impl Default for SecurityConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Authentication configuration
+// ---------------------------------------------------------------------------
+
+/// Authentication mode selected by the `[auth]` section.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthMode {
+    /// Public Binding server; authentication attributes are ignored.
+    #[default]
+    Disabled,
+    /// Short-term credentials keyed by raw password bytes.
+    ShortTerm,
+    /// Long-term credentials with REALM/NONCE challenge and MD5-derived keys.
+    LongTerm,
+}
+
+/// One configured username/password pair.
+#[derive(Deserialize, Clone)]
+pub struct UserCredential {
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for UserCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserCredential")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The optional `[auth]` configuration section.
+#[derive(Deserialize, Clone, Default)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub mode: AuthMode,
+
+    /// Long-term realm. Required when `mode = "long-term"`.
+    pub realm: Option<String>,
+
+    /// Lifetime of issued NONCE values in seconds (long-term only).
+    #[serde(default = "default_nonce_lifetime_sec")]
+    pub nonce_lifetime_sec: u64,
+
+    /// Configured credentials; required whenever authentication is enabled.
+    #[serde(default)]
+    pub users: Vec<UserCredential>,
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("mode", &self.mode)
+            .field("realm", &self.realm)
+            .field("nonce_lifetime_sec", &self.nonce_lifetime_sec)
+            .field("users", &self.users)
+            .finish()
+    }
+}
+
+impl AuthConfig {
+    /// Validate the section against the rules in `contracts/server-config.md`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.mode == AuthMode::Disabled {
+            return Ok(());
+        }
+
+        if self.users.is_empty() {
+            return Err(ConfigError::AuthNoUsers);
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for user in &self.users {
+            if user.username.trim().is_empty() {
+                return Err(ConfigError::AuthEmptyUsername);
+            }
+            if !seen.insert(user.username.as_str()) {
+                return Err(ConfigError::AuthDuplicateUsername(user.username.clone()));
+            }
+            if user.password.is_empty() {
+                return Err(ConfigError::AuthEmptyPassword(user.username.clone()));
+            }
+        }
+
+        if self.mode == AuthMode::LongTerm {
+            match &self.realm {
+                Some(realm) if !realm.trim().is_empty() => {}
+                _ => return Err(ConfigError::AuthMissingRealm),
+            }
+            if self.nonce_lifetime_sec == 0 || self.nonce_lifetime_sec > 86_400 {
+                return Err(ConfigError::InvalidNonceLifetime(self.nonce_lifetime_sec));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate the section and precompute the MESSAGE-INTEGRITY key for every
+    /// configured user. Long-term keys are `MD5(username ":" realm ":" SASLprep(password))`;
+    /// short-term keys are the raw password bytes.
+    pub fn precompute_keys(&self) -> Result<AuthTable, ConfigError> {
+        self.validate()?;
+
+        if self.mode == AuthMode::Disabled {
+            return Ok(AuthTable {
+                mode: AuthMode::Disabled,
+                realm: String::new(),
+                nonce_lifetime_sec: self.nonce_lifetime_sec,
+                users: HashMap::new(),
+            });
+        }
+
+        let realm = self.realm.clone().unwrap_or_default();
+        let mut users = HashMap::with_capacity(self.users.len());
+        for user in &self.users {
+            let key = match self.mode {
+                AuthMode::ShortTerm => user.password.as_bytes().to_vec(),
+                AuthMode::LongTerm => {
+                    stun_protocol::integrity::long_term_key(&user.username, &realm, &user.password)
+                        .map_err(|_| ConfigError::AuthKeyDerivation(user.username.clone()))?
+                        .to_vec()
+                }
+                AuthMode::Disabled => unreachable!("handled above"),
+            };
+            users.insert(user.username.clone(), key);
+        }
+
+        Ok(AuthTable {
+            mode: self.mode,
+            realm,
+            nonce_lifetime_sec: self.nonce_lifetime_sec,
+            users,
+        })
+    }
+}
+
+/// Authentication state resolved at startup: mode, realm, nonce lifetime, and
+/// the precomputed key for every user.
+#[derive(Clone)]
+pub struct AuthTable {
+    mode: AuthMode,
+    realm: String,
+    nonce_lifetime_sec: u64,
+    users: HashMap<String, Vec<u8>>,
+}
+
+impl AuthTable {
+    pub fn mode(&self) -> AuthMode {
+        self.mode
+    }
+
+    pub fn realm(&self) -> &str {
+        &self.realm
+    }
+
+    pub fn nonce_lifetime_sec(&self) -> u64 {
+        self.nonce_lifetime_sec
+    }
+
+    /// Look up a user's MESSAGE-INTEGRITY key.
+    pub fn key_for(&self, username: &str) -> Option<&[u8]> {
+        self.users.get(username).map(Vec::as_slice)
+    }
+
+    pub fn is_empty_mode(&self) -> bool {
+        self.mode == AuthMode::Disabled
+    }
+}
+
+impl fmt::Debug for AuthTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthTable")
+            .field("mode", &self.mode)
+            .field("realm", &self.realm)
+            .field("nonce_lifetime_sec", &self.nonce_lifetime_sec)
+            .field("users", &format_args!("{} configured", self.users.len()))
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Configuration loading and validation
 // ---------------------------------------------------------------------------
 
@@ -303,6 +494,27 @@ pub enum ConfigError {
 
     #[error("TLS enabled but key path not provided")]
     MissingTlsKeyPath,
+
+    #[error("Authentication is enabled but no [[auth.users]] entries are configured")]
+    AuthNoUsers,
+
+    #[error("Authentication user entry has an empty username")]
+    AuthEmptyUsername,
+
+    #[error("Authentication user '{0}' is listed more than once")]
+    AuthDuplicateUsername(String),
+
+    #[error("Authentication user '{0}' has an empty password")]
+    AuthEmptyPassword(String),
+
+    #[error("Long-term authentication requires a non-empty realm")]
+    AuthMissingRealm,
+
+    #[error("Invalid nonce lifetime: {0}. Must be in range 1-86400 seconds")]
+    InvalidNonceLifetime(u64),
+
+    #[error("Failed to derive the authentication key for user '{0}'")]
+    AuthKeyDerivation(String),
 }
 
 /// Configuration path loaded when `--config` is not provided.
@@ -383,6 +595,9 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
             config.logging.retention_days,
         ));
     }
+
+    // Validate authentication config
+    config.auth.validate()?;
 
     // Validate security config
     if config.security.enable_tls {
@@ -747,5 +962,229 @@ enable_tls = false
         assert!(!config.enable_tls);
         assert!(config.tls_cert_path.is_none());
         assert!(config.tls_key_path.is_none());
+    }
+
+    // --- [auth] configuration tests (SC-009, SC-012) ---
+
+    #[test]
+    fn test_auth_absent_defaults_to_disabled() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.auth.mode, AuthMode::Disabled);
+        assert!(config.auth.users.is_empty());
+        assert!(validate_config(&config).is_ok());
+        assert!(config.auth.precompute_keys().unwrap().is_empty_mode());
+    }
+
+    #[test]
+    fn test_auth_unknown_mode_rejected() {
+        let result: Result<Config, _> = toml::from_str("[auth]\nmode = \"bogus\"\n");
+        assert!(result.is_err(), "unknown mode must be rejected");
+    }
+
+    #[test]
+    fn test_auth_enabled_requires_users() {
+        for mode in ["short-term", "long-term"] {
+            let toml_str = format!("[auth]\nmode = \"{mode}\"\nrealm = \"example.org\"\n");
+            let config: Config = toml::from_str(&toml_str).unwrap();
+            let err = validate_config(&config).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::AuthNoUsers),
+                "{mode} without users must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_auth_rejects_empty_username() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = ""
+password = "s3cret"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigError::AuthEmptyUsername
+        ));
+    }
+
+    #[test]
+    fn test_auth_rejects_duplicate_username() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "alice"
+password = "one"
+
+[[auth.users]]
+username = "alice"
+password = "two"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigError::AuthDuplicateUsername(ref name) if name == "alice"
+        ));
+    }
+
+    #[test]
+    fn test_auth_rejects_empty_password() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "alice"
+password = ""
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigError::AuthEmptyPassword(ref name) if name == "alice"
+        ));
+    }
+
+    #[test]
+    fn test_auth_long_term_requires_realm() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "long-term"
+
+[[auth.users]]
+username = "alice"
+password = "s3cret"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigError::AuthMissingRealm
+        ));
+
+        let blank: Config = toml::from_str(
+            r#"
+[auth]
+mode = "long-term"
+realm = "  "
+
+[[auth.users]]
+username = "alice"
+password = "s3cret"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_config(&blank).unwrap_err(),
+            ConfigError::AuthMissingRealm
+        ));
+    }
+
+    #[test]
+    fn test_auth_nonce_lifetime_bounds() {
+        for lifetime in [0u64, 86401] {
+            let toml_str = format!(
+                r#"
+[auth]
+mode = "long-term"
+realm = "example.org"
+nonce_lifetime_sec = {lifetime}
+
+[[auth.users]]
+username = "alice"
+password = "s3cret"
+"#
+            );
+            let config: Config = toml::from_str(&toml_str).unwrap();
+            assert!(matches!(
+                validate_config(&config).unwrap_err(),
+                ConfigError::InvalidNonceLifetime(v) if v == lifetime
+            ));
+        }
+
+        let ok: Config = toml::from_str(
+            r#"
+[auth]
+mode = "long-term"
+realm = "example.org"
+nonce_lifetime_sec = 3600
+
+[[auth.users]]
+username = "alice"
+password = "s3cret"
+"#,
+        )
+        .unwrap();
+        assert!(validate_config(&ok).is_ok());
+    }
+
+    #[test]
+    fn test_auth_short_term_key_is_raw_password() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "alice"
+password = "s3cret"
+"#,
+        )
+        .unwrap();
+        let table = config.auth.precompute_keys().unwrap();
+        assert_eq!(table.key_for("alice"), Some(&b"s3cret"[..]));
+        assert_eq!(table.key_for("bob"), None);
+    }
+
+    #[test]
+    fn test_auth_long_term_key_is_md5_digest() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "long-term"
+realm = "example.org"
+
+[[auth.users]]
+username = "alice"
+password = "change-me"
+"#,
+        )
+        .unwrap();
+        let table = config.auth.precompute_keys().unwrap();
+        let key = table.key_for("alice").expect("key");
+        assert_eq!(key.len(), 16);
+        assert_eq!(
+            key,
+            stun_protocol::integrity::long_term_key("alice", "example.org", "change-me").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_auth_debug_output_hides_passwords() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "alice"
+password = "super-secret-value"
+"#,
+        )
+        .unwrap();
+        let table = config.auth.precompute_keys().unwrap();
+        let rendered = format!("{:?} {:?}", config.auth, table);
+        assert!(!rendered.contains("super-secret-value"));
     }
 }

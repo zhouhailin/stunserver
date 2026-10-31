@@ -3,8 +3,9 @@
 //! This module implements STUN message parsing and serialization according to
 //! RFC 5389 Section 6 (STUN Message Structure).
 
-use crate::attributes::StunAttribute;
+use crate::attributes::{StunAttribute, StunAttributeType};
 use crate::error::StunError;
+use crate::integrity::{self, FINGERPRINT_LEN, MESSAGE_INTEGRITY_LEN};
 use byteorder::{BigEndian, ByteOrder};
 
 /// STUN message types as defined in RFC 5389 Section 6
@@ -103,6 +104,137 @@ impl StunMessage {
         self.message_length = total_attr_len as u16;
     }
 
+    /// Byte offset of every attribute, starting after the 20-byte header.
+    pub fn attribute_offsets(&self) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(self.attributes.len());
+        let mut offset = HEADER_SIZE;
+        for attr in &self.attributes {
+            offsets.push(offset);
+            offset += attr.encoded_size();
+        }
+        offsets
+    }
+
+    /// Number of attributes carrying `raw_type`.
+    pub fn attribute_count(&self, raw_type: u16) -> usize {
+        self.attributes
+            .iter()
+            .filter(|attr| attr.raw_type == raw_type)
+            .count()
+    }
+
+    /// Byte offset of the first attribute carrying `raw_type`.
+    pub fn attribute_offset(&self, raw_type: u16) -> Option<usize> {
+        let mut offset = HEADER_SIZE;
+        for attr in &self.attributes {
+            if attr.raw_type == raw_type {
+                return Some(offset);
+            }
+            offset += attr.encoded_size();
+        }
+        None
+    }
+
+    /// Encode the message with a terminal MESSAGE-INTEGRITY attribute.
+    pub fn encode_with_integrity(&self, key: &[u8]) -> Vec<u8> {
+        let mut message = self.clone();
+        message.add_attribute(StunAttribute::new(
+            StunAttributeType::MessageIntegrity,
+            vec![0u8; MESSAGE_INTEGRITY_LEN],
+        ));
+        let mi_offset = HEADER_SIZE + message.message_length as usize - (4 + MESSAGE_INTEGRITY_LEN);
+        let mut buffer = message.encode();
+        let digest = integrity::hmac_sha1(key, &integrity::hmac_input(&buffer, mi_offset));
+        buffer[mi_offset + 4..mi_offset + 4 + MESSAGE_INTEGRITY_LEN].copy_from_slice(&digest);
+        buffer
+    }
+
+    /// Encode the message with a terminal FINGERPRINT attribute.
+    pub fn encode_with_fingerprint(&self) -> Vec<u8> {
+        let mut message = self.clone();
+        message.add_attribute(StunAttribute::new(
+            StunAttributeType::Fingerprint,
+            vec![0u8; FINGERPRINT_LEN],
+        ));
+        let fp_offset = HEADER_SIZE + message.message_length as usize - (4 + FINGERPRINT_LEN);
+        let mut buffer = message.encode();
+        let crc = integrity::fingerprint(&buffer[..fp_offset]);
+        buffer[fp_offset + 4..fp_offset + 4 + FINGERPRINT_LEN].copy_from_slice(&crc.to_be_bytes());
+        buffer
+    }
+
+    /// Encode the message with MESSAGE-INTEGRITY followed by FINGERPRINT.
+    pub fn encode_with_integrity_and_fingerprint(&self, key: &[u8]) -> Vec<u8> {
+        let mut message = self.clone();
+        message.add_attribute(StunAttribute::new(
+            StunAttributeType::MessageIntegrity,
+            vec![0u8; MESSAGE_INTEGRITY_LEN],
+        ));
+        message.add_attribute(StunAttribute::new(
+            StunAttributeType::Fingerprint,
+            vec![0u8; FINGERPRINT_LEN],
+        ));
+
+        let total = HEADER_SIZE + message.message_length as usize;
+        let fp_offset = total - (4 + FINGERPRINT_LEN);
+        let mi_offset = fp_offset - (4 + MESSAGE_INTEGRITY_LEN);
+
+        let mut buffer = message.encode();
+        let digest = integrity::hmac_sha1(key, &integrity::hmac_input(&buffer, mi_offset));
+        buffer[mi_offset + 4..mi_offset + 4 + MESSAGE_INTEGRITY_LEN].copy_from_slice(&digest);
+
+        let crc = integrity::fingerprint(&buffer[..fp_offset]);
+        buffer[fp_offset + 4..fp_offset + 4 + FINGERPRINT_LEN].copy_from_slice(&crc.to_be_bytes());
+        buffer
+    }
+
+    /// Verify the MESSAGE-INTEGRITY of an encoded message.
+    ///
+    /// Returns `false` unless the message carries exactly one
+    /// MESSAGE-INTEGRITY attribute with a matching digest.
+    pub fn verify_message_integrity(encoded: &[u8], key: &[u8]) -> bool {
+        let Ok(message) = Self::decode(encoded) else {
+            return false;
+        };
+        if message.attribute_count(StunAttributeType::MessageIntegrity as u16) != 1 {
+            return false;
+        }
+        let Some(index) = message
+            .attributes
+            .iter()
+            .position(|attr| attr.raw_type == StunAttributeType::MessageIntegrity as u16)
+        else {
+            return false;
+        };
+        let offset = message.attribute_offsets()[index];
+        let input = integrity::hmac_input(encoded, offset);
+        integrity::verify_hmac_sha1(key, &input, &message.attributes[index].attribute_value)
+    }
+
+    /// Verify a FINGERPRINT of an encoded message.
+    ///
+    /// Returns `false` unless the message ends with exactly one FINGERPRINT
+    /// attribute whose value matches the CRC-32 of the preceding bytes XOR
+    /// `0x5354554E` (RFC 5389 section 15.5).
+    pub fn verify_message_fingerprint(encoded: &[u8]) -> bool {
+        let Ok(message) = Self::decode(encoded) else {
+            return false;
+        };
+        if message.attribute_count(StunAttributeType::Fingerprint as u16) != 1 {
+            return false;
+        }
+        let Some(last) = message.attributes.last() else {
+            return false;
+        };
+        if last.raw_type != StunAttributeType::Fingerprint as u16 {
+            return false;
+        }
+        let Some(offset) = message.attribute_offset(StunAttributeType::Fingerprint as u16) else {
+            return false;
+        };
+        integrity::verify_fingerprint(&encoded[..offset], &last.attribute_value)
+    }
+
     /// Encode message to byte buffer
     pub fn encode(&self) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(HEADER_SIZE + self.message_length as usize);
@@ -142,6 +274,15 @@ impl StunMessage {
                 "Message too short: {} bytes, minimum {}",
                 data.len(),
                 HEADER_SIZE
+            )));
+        }
+
+        // RFC 5389 section 6: the two most significant bits of the message
+        // type MUST be zero.
+        if data[0] & 0xC0 != 0 {
+            return Err(StunError::MalformedMessage(format!(
+                "Message type leading bits must be zero: 0x{:04X}",
+                BigEndian::read_u16(&data[0..2])
             )));
         }
 

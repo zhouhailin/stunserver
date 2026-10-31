@@ -356,6 +356,146 @@ fn test_fingerprint_rejects_other_lengths() {
 }
 
 #[test]
+fn test_attribute_offsets_accumulate_encoded_size() {
+    let mut msg = StunMessage::new(StunMessageType::Request, [0x11; 12]);
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Software,
+        b"test".to_vec(),
+    ));
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Username,
+        b"alice".to_vec(),
+    ));
+
+    // SOFTWARE(4+4=8), USERNAME(4+5+3 padding=12).
+    assert_eq!(msg.attribute_offsets(), vec![20, 28]);
+    assert_eq!(msg.attribute_count(0x8022), 1);
+    assert_eq!(msg.attribute_count(0x0008), 0);
+}
+
+#[test]
+fn test_encode_with_integrity_length_and_hmac_range() {
+    use stun_protocol::integrity::{hmac_sha1, verify_hmac_sha1};
+
+    let key = b"integrity-key";
+    let mut msg = StunMessage::new(StunMessageType::Request, [0x22; 12]);
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Software,
+        b"test-client".to_vec(),
+    ));
+
+    let bytes = msg.encode_with_integrity(key);
+
+    // SOFTWARE encodes to 16 bytes, MESSAGE-INTEGRITY to 24 bytes.
+    assert_eq!(bytes.len(), 20 + 16 + 24);
+    assert_eq!(bytes.len(), 60);
+    // The header length covers the MESSAGE-INTEGRITY attribute.
+    assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 40);
+
+    let mi_offset = 36;
+    assert_eq!(&bytes[mi_offset..mi_offset + 2], &[0x00, 0x08]);
+    assert_eq!(&bytes[mi_offset + 2..mi_offset + 4], &[0x00, 0x14]);
+
+    // The digest is computed over the header (length adjusted to end at the
+    // MESSAGE-INTEGRITY attribute) plus the preceding attributes only.
+    let mut input = bytes[..mi_offset].to_vec();
+    input[2..4].copy_from_slice(&40u16.to_be_bytes());
+    let expected = hmac_sha1(key, &input);
+    assert_eq!(&bytes[mi_offset + 4..], &expected[..]);
+    assert!(verify_hmac_sha1(key, &input, &bytes[mi_offset + 4..]));
+}
+
+#[test]
+fn test_encode_with_integrity_and_fingerprint_uses_mi_length_for_hmac() {
+    use stun_protocol::integrity::{fingerprint, hmac_sha1};
+
+    let key = b"integrity-key";
+    let mut msg = StunMessage::new(StunMessageType::Response, [0x33; 12]);
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Software,
+        b"test".to_vec(),
+    ));
+
+    let bytes = msg.encode_with_integrity_and_fingerprint(key);
+
+    // 20-byte header + 8-byte SOFTWARE + 24-byte MI + 8-byte FINGERPRINT.
+    assert_eq!(bytes.len(), 60);
+    // The wire header length counts both trailing attributes.
+    assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 40);
+
+    let mi_offset = 28;
+    let fp_offset = 52;
+    assert_eq!(&bytes[fp_offset..fp_offset + 2], &[0x80, 0x28]);
+
+    // HMAC input ends at MESSAGE-INTEGRITY, even though FINGERPRINT follows.
+    let mut hmac_input = bytes[..mi_offset].to_vec();
+    hmac_input[2..4].copy_from_slice(&32u16.to_be_bytes());
+    assert_eq!(
+        &bytes[mi_offset + 4..mi_offset + 24],
+        &hmac_sha1(key, &hmac_input)
+    );
+
+    // FINGERPRINT is computed over the message with the final header length.
+    assert_eq!(
+        u32::from_be_bytes([
+            bytes[fp_offset + 4],
+            bytes[fp_offset + 5],
+            bytes[fp_offset + 6],
+            bytes[fp_offset + 7],
+        ]),
+        fingerprint(&bytes[..fp_offset])
+    );
+}
+
+#[test]
+fn test_encode_with_fingerprint_is_terminal() {
+    use stun_protocol::integrity::verify_fingerprint;
+
+    let mut msg = StunMessage::new(StunMessageType::Request, [0x44; 12]);
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Software,
+        b"bench".to_vec(),
+    ));
+
+    let bytes = msg.encode_with_fingerprint();
+    let fp_offset = bytes.len() - 8;
+
+    assert_eq!(&bytes[fp_offset..fp_offset + 2], &[0x80, 0x28]);
+    assert_eq!(
+        u16::from_be_bytes([bytes[fp_offset + 2], bytes[fp_offset + 3]]),
+        4
+    );
+    assert!(verify_fingerprint(
+        &bytes[..fp_offset],
+        &bytes[fp_offset + 4..]
+    ));
+}
+
+#[test]
+fn test_duplicate_integrity_attributes_are_countable() {
+    let mut msg = StunMessage::new(StunMessageType::Request, [0x55; 12]);
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::MessageIntegrity,
+        vec![0u8; 20],
+    ));
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::MessageIntegrity,
+        vec![0u8; 20],
+    ));
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Fingerprint,
+        vec![0u8; 4],
+    ));
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Fingerprint,
+        vec![0u8; 4],
+    ));
+
+    assert_eq!(msg.attribute_count(0x0008), 2);
+    assert_eq!(msg.attribute_count(0x8028), 2);
+}
+
+#[test]
 fn test_message_decode_validates_fixed_attribute_lengths() {
     let valid = message_with_raw_attribute(0x0008, &[0u8; 20]);
     let decoded = StunMessage::decode(&valid).unwrap();
@@ -369,4 +509,121 @@ fn test_message_decode_validates_fixed_attribute_lengths() {
     let err =
         StunMessage::decode(&invalid_fingerprint).expect_err("oversized FINGERPRINT must fail");
     assert!(matches!(err, StunError::MalformedMessage(_)));
+}
+
+/// Build a Binding Request from raw attribute encodings with a header length
+/// covering every supplied attribute.
+fn request_with_raw_attributes(attributes: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = attributes.iter().map(|attribute| attribute.len()).sum();
+    let mut bytes = Vec::with_capacity(20 + total);
+    bytes.extend_from_slice(&0x0001u16.to_be_bytes());
+    bytes.extend_from_slice(&(total as u16).to_be_bytes());
+    bytes.extend_from_slice(&0x2112A442u32.to_be_bytes());
+    bytes.extend_from_slice(&[0x77; 12]);
+    for attribute in attributes {
+        bytes.extend_from_slice(attribute);
+    }
+    bytes
+}
+
+#[test]
+fn test_verify_fingerprint_uses_final_length_header() {
+    use stun_protocol::integrity::{fingerprint, verify_fingerprint};
+
+    let mut msg = StunMessage::new(StunMessageType::Request, [0x66; 12]);
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Software,
+        b"fp".to_vec(),
+    ));
+    let bytes = msg.encode_with_fingerprint();
+    let fp_offset = bytes.len() - 8;
+
+    // The header length already counts the FINGERPRINT attribute itself.
+    assert_eq!(
+        usize::from(u16::from_be_bytes([bytes[2], bytes[3]])),
+        bytes.len() - 20
+    );
+    assert_eq!(
+        u32::from_be_bytes([
+            bytes[fp_offset + 4],
+            bytes[fp_offset + 5],
+            bytes[fp_offset + 6],
+            bytes[fp_offset + 7],
+        ]),
+        fingerprint(&bytes[..fp_offset])
+    );
+    assert!(verify_fingerprint(
+        &bytes[..fp_offset],
+        &bytes[fp_offset + 4..]
+    ));
+    assert!(StunMessage::verify_message_fingerprint(&bytes));
+}
+
+#[test]
+fn test_verify_fingerprint_rejects_non_final_attribute() {
+    use stun_protocol::integrity::fingerprint;
+
+    let mut bytes = request_with_raw_attributes(&[
+        raw_attribute_bytes(0x8028, &[0u8; 4]),
+        raw_attribute_bytes(0x8022, b"tail"),
+    ]);
+    // Give the FINGERPRINT a correct CRC for a prefix that ends before it even
+    // though it is not the final attribute.
+    let crc = fingerprint(&bytes[..20]);
+    bytes[24..28].copy_from_slice(&crc.to_be_bytes());
+
+    assert!(
+        !StunMessage::verify_message_fingerprint(&bytes),
+        "FINGERPRINT must be the final attribute"
+    );
+}
+
+#[test]
+fn test_verify_fingerprint_rejects_duplicate_attributes() {
+    use stun_protocol::integrity::fingerprint;
+
+    let mut bytes = request_with_raw_attributes(&[
+        raw_attribute_bytes(0x8028, &[0u8; 4]),
+        raw_attribute_bytes(0x8028, &[0u8; 4]),
+    ]);
+    // The first FINGERPRINT carries a correct CRC so only uniqueness rejects it.
+    let crc = fingerprint(&bytes[..20]);
+    bytes[24..28].copy_from_slice(&crc.to_be_bytes());
+
+    assert!(
+        !StunMessage::verify_message_fingerprint(&bytes),
+        "duplicate FINGERPRINT must be rejected"
+    );
+}
+
+#[test]
+fn test_verify_integrity_rejects_duplicate_attributes() {
+    use stun_protocol::integrity::{hmac_input, hmac_sha1};
+
+    let key = b"integrity-key";
+    let mut bytes = request_with_raw_attributes(&[
+        raw_attribute_bytes(0x0008, &[0u8; 20]),
+        raw_attribute_bytes(0x0008, &[0u8; 20]),
+    ]);
+    // Make the first MESSAGE-INTEGRITY valid so only uniqueness rejects it.
+    let digest = hmac_sha1(key, &hmac_input(&bytes, 20));
+    bytes[24..44].copy_from_slice(&digest);
+
+    assert!(
+        !StunMessage::verify_message_integrity(&bytes, key),
+        "duplicate MESSAGE-INTEGRITY must be rejected"
+    );
+}
+
+#[test]
+fn test_verify_integrity_accepts_single_valid_attribute() {
+    let key = b"integrity-key";
+    let mut msg = StunMessage::new(StunMessageType::Request, [0x77; 12]);
+    msg.add_attribute(StunAttribute::new(
+        StunAttributeType::Software,
+        b"client".to_vec(),
+    ));
+    let bytes = msg.encode_with_integrity(key);
+
+    assert!(StunMessage::verify_message_integrity(&bytes, key));
 }

@@ -23,3 +23,13 @@ cargo run --bin stunserver -- --config config/stunserver.conf
 ```
 
 `config/stunserver.conf` 属于本地自定义配置（已加入 `.gitignore`），修改后不要提交；模板变更时请同步更新 `deploy/stunserver.conf.example`。
+
+## 认证配置与文件权限
+
+`[auth]` 支持 `disabled`（默认）、`short-term`、`long-term` 三种模式；启用后至少需要一个 `[[auth.users]]` 条目，`long-term` 还需要非空 `realm`。字段说明见根目录 `README.md`。
+
+该文件以明文保存密码，请务必：
+
+- 将配置文件权限设为 `chmod 600 config/stunserver.conf`；
+- 不要将生产凭据提交到版本库；
+- 客户端优先使用 `STUNCLIENT_PASSWORD` 环境变量传递密码，避免 `--password` 出现在进程列表中。

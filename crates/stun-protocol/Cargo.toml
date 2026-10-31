@@ -9,5 +9,11 @@ description = "STUN protocol implementation (RFC 5389)"
 [dependencies]
 byteorder.workspace = true
 thiserror.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+md-5.workspace = true
+subtle.workspace = true
+crc32fast.workspace = true
+stringprep.workspace = true
 
 [dev-dependencies]

@@ -2,6 +2,7 @@
 //!
 //! Re-exports internal modules for integration testing.
 
+pub mod auth;
 pub mod config;
 pub mod logging;
 pub mod metadata;

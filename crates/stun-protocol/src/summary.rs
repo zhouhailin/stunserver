@@ -37,11 +37,14 @@ pub fn describe_attribute(
     let name = attribute_name(attr.attribute_type);
 
     match attr.attribute_type {
-        StunAttributeType::Software => {
+        StunAttributeType::Software | StunAttributeType::Username | StunAttributeType::Realm => {
             format!(
-                "SOFTWARE=\"{}\"",
+                "{name}=\"{}\"",
                 String::from_utf8_lossy(&attr.attribute_value)
             )
+        }
+        StunAttributeType::MessageIntegrity | StunAttributeType::Fingerprint => {
+            format!("{name}(len={length})")
         }
         StunAttributeType::ErrorCode => match ErrorCode::decode_value(&attr.attribute_value) {
             Ok(code) => format!("ERROR-CODE={} \"{}\"", code.status_code(), code.reason),
@@ -64,6 +67,7 @@ pub fn describe_attribute(
             }
         }
         StunAttributeType::MappedAddress
+        | StunAttributeType::AlternateServer
         | StunAttributeType::ResponseOrigin
         | StunAttributeType::OtherAddress => match MappedAddress::decode(&attr.attribute_value) {
             Ok(address) => format!("{name}={}", format_address(address)),
@@ -88,15 +92,21 @@ fn attribute_name(attribute_type: StunAttributeType) -> &'static str {
     match attribute_type {
         StunAttributeType::MappedAddress => "MAPPED-ADDRESS",
         StunAttributeType::ChangeRequest => "CHANGE-REQUEST",
+        StunAttributeType::Username => "USERNAME",
+        StunAttributeType::MessageIntegrity => "MESSAGE-INTEGRITY",
         StunAttributeType::ErrorCode => "ERROR-CODE",
         StunAttributeType::UnknownAttributes => "UNKNOWN-ATTRIBUTES",
+        StunAttributeType::Realm => "REALM",
+        StunAttributeType::Nonce => "NONCE",
         StunAttributeType::XorMappedAddress => "XOR-MAPPED-ADDRESS",
         StunAttributeType::Padding => "PADDING",
         StunAttributeType::ResponsePort => "RESPONSE-PORT",
         StunAttributeType::Software => "SOFTWARE",
+        StunAttributeType::AlternateServer => "ALTERNATE-SERVER",
         StunAttributeType::CacheTimeout => "CACHE-TIMEOUT",
         StunAttributeType::ResponseOrigin => "RESPONSE-ORIGIN",
         StunAttributeType::OtherAddress => "OTHER-ADDRESS",
+        StunAttributeType::Fingerprint => "FINGERPRINT",
         StunAttributeType::Unknown => "UNKNOWN",
     }
 }
@@ -225,6 +235,80 @@ mod tests {
         assert_eq!(
             describe_attribute(&attr, MAGIC_COOKIE, &TXN),
             "UNKNOWN-ATTRIBUTES(len=3)"
+        );
+    }
+
+    #[test]
+    fn test_describe_rfc5389_auth_attribute_names() {
+        assert_eq!(
+            describe_attribute(
+                &StunAttribute::new(StunAttributeType::Username, b"alice".to_vec()),
+                MAGIC_COOKIE,
+                &TXN
+            ),
+            "USERNAME=\"alice\""
+        );
+        assert_eq!(
+            describe_attribute(
+                &StunAttribute::new(StunAttributeType::Realm, b"example.org".to_vec()),
+                MAGIC_COOKIE,
+                &TXN
+            ),
+            "REALM=\"example.org\""
+        );
+        assert_eq!(
+            describe_attribute(
+                &StunAttribute::new(StunAttributeType::Nonce, vec![b'a'; 48]),
+                MAGIC_COOKIE,
+                &TXN
+            ),
+            "NONCE(len=48)"
+        );
+        assert_eq!(
+            describe_attribute(
+                &StunAttribute::new(StunAttributeType::MessageIntegrity, vec![0u8; 20]),
+                MAGIC_COOKIE,
+                &TXN
+            ),
+            "MESSAGE-INTEGRITY(len=20)"
+        );
+        assert_eq!(
+            describe_attribute(
+                &StunAttribute::new(StunAttributeType::Fingerprint, vec![0u8; 4]),
+                MAGIC_COOKIE,
+                &TXN
+            ),
+            "FINGERPRINT(len=4)"
+        );
+    }
+
+    #[test]
+    fn test_describe_alternate_server_address() {
+        use crate::AddressFamily;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let address = MappedAddress {
+            family: AddressFamily::IPv4,
+            port: 3478,
+            address: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+        };
+
+        assert_eq!(
+            describe_attribute(
+                &StunAttribute::new(StunAttributeType::AlternateServer, address.encode()),
+                MAGIC_COOKIE,
+                &TXN
+            ),
+            "ALTERNATE-SERVER=198.51.100.7:3478"
+        );
+    }
+
+    #[test]
+    fn test_describe_unrecognized_type_is_hex_code() {
+        let attr = StunAttribute::decode(&[0x00, 0x24, 0x00, 0x04, 0, 0, 0, 0]).unwrap();
+        assert_eq!(
+            describe_attribute(&attr, MAGIC_COOKIE, &TXN),
+            "0x0024(len=4)"
         );
     }
 

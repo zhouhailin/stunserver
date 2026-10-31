@@ -12,6 +12,13 @@
 - 🐳 **Docker 支持**：多阶段构建，镜像体积最小化
 - 🔄 **CI/CD 就绪**：GitHub Actions 自动化构建和发布
 - 📝 **完善的日志**：内置日志轮转和管理功能
+- 📋 **RFC 一致性**：针对 RFC 5389/5769/5780 的可追溯审计矩阵，详见 [docs/rfc-conformance.md](docs/rfc-conformance.md)
+
+## 协议范围
+
+本服务器通过 UDP 实现 STUN Binding（RFC 5389）。它是单地址服务器：不提供 NAT 行为
+发现能力，任何响应都不会包含 OTHER-ADDRESS 或 RESPONSE-ORIGIN。TCP、TLS 以及 RFC 3489
+旧版兼容均不在支持范围内。
 
 ## 快速开始
 
@@ -107,6 +114,40 @@ tcp_idle_timeout_sec = 300
 - `STUN_LOG_LEVEL`：日志级别（trace, debug, info, warn, error）
 - `STUN_PORT`：监听端口（默认：3478）
 - `STUN_LISTEN_ADDRESS`：监听地址（默认：0.0.0.0）
+
+### 认证配置
+
+服务端通过 `[auth]` 支持 `disabled`（默认）、`short-term`、`long-term` 三种模式。启用认证后不会回退到未认证的成功响应。
+
+```toml
+[auth]
+mode = "short-term"   # "disabled"、"short-term" 或 "long-term"
+
+[[auth.users]]
+username = "alice"
+password = "change-me"
+
+# 仅 long-term：realm 必填；nonce_lifetime_sec 默认 600
+# mode = "long-term"
+# realm = "example.org"
+# nonce_lifetime_sec = 600
+```
+
+`long-term` 模式下，客户端先收到携带 REALM 与 NONCE 的未签名 401 挑战，再以签名请求重试。NONCE 过期时返回 438 并附带新 NONCE，客户端最多重试两次。`nonce_lifetime_sec` 取值范围为 1 到 86400。
+
+配置文件以明文保存密码，请仅允许服务账号读取：
+
+```bash
+chmod 600 /opt/stunserver/etc/stunserver.conf
+```
+
+不要提交生产凭据。自带客户端优先使用 `STUNCLIENT_PASSWORD` 环境变量而非 `--password`，因为命令行参数会出现在进程列表中：
+
+```bash
+STUNCLIENT_PASSWORD='change-me' stunclient --auth-mode long-term --username alice stun.example.org:3478
+```
+
+MESSAGE-INTEGRITY 只保证完整性，UDP 流量不会被加密。
 
 ## 目录结构
 

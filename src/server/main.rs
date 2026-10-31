@@ -72,6 +72,15 @@ fn main() {
         process::exit(1);
     }
 
+    // Resolve authentication (derives keys once; never logs secrets).
+    let auth = match stunserver::auth::AuthService::from_config(&cfg.auth) {
+        Ok(auth) => auth,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
     // Display build info.
     if !args.quiet {
         let metadata = BuildMetadata::capture();
@@ -93,9 +102,10 @@ fn main() {
     };
 
     log::info!("Starting STUN server on {}", listen_addr);
+    log::info!("Authentication mode: {:?}", auth.mode());
 
     // Create server state.
-    let state = Arc::new(server::ServerState::new());
+    let state = Arc::new(server::ServerState::with_auth(auth));
 
     // Build and run the Tokio runtime.
     let runtime = match tokio::runtime::Runtime::new() {

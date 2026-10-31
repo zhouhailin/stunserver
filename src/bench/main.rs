@@ -58,6 +58,10 @@ struct Args {
     /// Use only IPv6 addresses.
     #[arg(short = '6', long = "ipv6-only", conflicts_with = "ipv4_only")]
     ipv6_only: bool,
+
+    /// Append a valid terminal FINGERPRINT to every request.
+    #[arg(long)]
+    fingerprint: bool,
 }
 
 fn main() {
@@ -119,6 +123,7 @@ fn main() {
             target_qps: args.qps,
             duration: None,
             request_count: Some(requests),
+            fingerprint: args.fingerprint,
         }
     } else {
         println!(
@@ -130,6 +135,7 @@ fn main() {
             target_qps: args.qps,
             duration: Some(Duration::from_secs(args.duration)),
             request_count: None,
+            fingerprint: args.fingerprint,
         }
     };
 
@@ -238,6 +244,25 @@ mod tests {
     fn test_level_unset_without_flags() {
         let args = parse(&["stunbench", "127.0.0.1", "--qps", "10"]);
         assert_eq!(requested_log_level(&args), None);
+    }
+
+    #[test]
+    fn test_fingerprint_flag_parsed() {
+        let args = parse(&["stunbench", "127.0.0.1", "--qps", "10", "--fingerprint"]);
+        assert!(args.fingerprint);
+    }
+
+    #[test]
+    fn test_fingerprint_defaults_off() {
+        let args = parse(&["stunbench", "127.0.0.1", "--qps", "10"]);
+        assert!(!args.fingerprint);
+    }
+
+    #[test]
+    fn test_help_documents_fingerprint() {
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("--fingerprint"));
+        assert!(help.contains("FINGERPRINT"));
     }
 
     #[test]

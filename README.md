@@ -12,6 +12,14 @@ A high-performance STUN (Session Traversal Utilities for NAT) server implementat
 - 🐳 **Docker Support**: Multi-stage builds with minimal image size
 - 🔄 **CI/CD Ready**: GitHub Actions workflow for automated builds
 - 📝 **Comprehensive Logging**: Built-in log rotation and management
+- 📋 **RFC Conformance**: Traceable audit matrix against RFC 5389/5769/5780 in [docs/rfc-conformance.md](docs/rfc-conformance.md)
+
+## Protocol Scope
+
+This server implements STUN Binding (RFC 5389) over UDP. It is a single-address
+server: it offers no NAT behavior discovery, and no response ever includes
+OTHER-ADDRESS or RESPONSE-ORIGIN. TCP, TLS, and legacy RFC 3489 handling are out
+of scope.
 
 ## Quick Start
 
@@ -107,6 +115,40 @@ When running in Docker, you can override configuration with environment variable
 - `STUN_LOG_LEVEL`: Log level (trace, debug, info, warn, error)
 - `STUN_PORT`: Listening port (default: 3478)
 - `STUN_LISTEN_ADDRESS`: Listen address (default: 0.0.0.0)
+
+### Authentication
+
+The server supports `disabled` (default), `short-term`, and `long-term` credentials through the `[auth]` section. An enabled mode never falls back to unauthenticated success.
+
+```toml
+[auth]
+mode = "short-term"   # "disabled", "short-term", or "long-term"
+
+[[auth.users]]
+username = "alice"
+password = "change-me"
+
+# long-term only: realm is required; nonce_lifetime_sec defaults to 600
+# mode = "long-term"
+# realm = "example.org"
+# nonce_lifetime_sec = 600
+```
+
+With `long-term`, the client first receives an unsigned 401 challenge carrying REALM and NONCE and then retries with a signed request. A stale NONCE yields 438 with a fresh NONCE; the client retries at most twice. `nonce_lifetime_sec` must be between 1 and 86400.
+
+The configuration file stores passwords in plaintext, so restrict it to the service account:
+
+```bash
+chmod 600 /opt/stunserver/etc/stunserver.conf
+```
+
+Never commit production credentials. For the bundled client, prefer `STUNCLIENT_PASSWORD` over `--password`, because command-line arguments are visible in process listings:
+
+```bash
+STUNCLIENT_PASSWORD='change-me' stunclient --auth-mode long-term --username alice stun.example.org:3478
+```
+
+MESSAGE-INTEGRITY provides integrity only; UDP traffic is not encrypted.
 
 ## Directory Structure
 

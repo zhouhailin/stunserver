@@ -4,6 +4,7 @@
 //! end-to-end benchmark execution against a mock STUN server.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stun_protocol::{
@@ -54,6 +55,7 @@ async fn test_benchmark_short_duration() {
         target_qps: 100,
         duration: Some(Duration::from_secs(2)),
         request_count: None,
+        fingerprint: false,
     };
 
     let stats = bench::run_benchmark(&config).await.unwrap();
@@ -73,6 +75,7 @@ async fn test_benchmark_request_count() {
         target_qps: 500,
         duration: None,
         request_count: Some(100),
+        fingerprint: false,
     };
 
     let stats = bench::run_benchmark(&config).await.unwrap();
@@ -163,4 +166,77 @@ fn test_benchmark_stats_low_success_rate() {
 
     assert!((stats.success_rate - 10.0).abs() < 0.01);
     assert_eq!(stats.failed_requests, 900);
+}
+
+#[test]
+fn test_build_request_without_fingerprint() {
+    let (message, bytes) = bench::build_request([0x42; 12], false);
+
+    assert_eq!(
+        message.attribute_count(StunAttributeType::Fingerprint as u16),
+        0
+    );
+    assert!(!StunMessage::verify_message_fingerprint(&bytes));
+}
+
+#[test]
+fn test_build_request_with_terminal_fingerprint() {
+    let (message, bytes) = bench::build_request([0x42; 12], true);
+
+    assert_eq!(
+        message.attribute_count(StunAttributeType::Fingerprint as u16),
+        1
+    );
+    assert_eq!(
+        message.attributes.last().unwrap().raw_type,
+        StunAttributeType::Fingerprint as u16
+    );
+    assert!(StunMessage::verify_message_fingerprint(&bytes));
+}
+
+#[tokio::test]
+async fn test_benchmark_with_fingerprint_succeeds() {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let socket = Arc::new(socket);
+
+    let verified = Arc::new(AtomicUsize::new(0));
+    let counter = verified.clone();
+    let verifier = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let (len, from) = match socket.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if !StunMessage::verify_message_fingerprint(&buf[..len]) {
+                continue;
+            }
+            if let Ok(request) = StunMessage::decode(&buf[..len]) {
+                let mut response =
+                    StunMessage::new(StunMessageType::Response, request.transaction_id);
+                let mapped = MappedAddress::new(from.ip(), from.port());
+                let xor_value = mapped.encode_xor(response.magic_cookie, &response.transaction_id);
+                response.add_attribute(StunAttribute::new(
+                    StunAttributeType::XorMappedAddress,
+                    xor_value,
+                ));
+                let _ = socket.send_to(&response.encode(), from).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    let config = BenchConfig {
+        server_addrs: vec![addr],
+        target_qps: 200,
+        duration: None,
+        request_count: Some(50),
+        fingerprint: true,
+    };
+    let stats = bench::run_benchmark(&config).await.unwrap();
+
+    verifier.abort();
+    assert!(stats.successful_requests > 0);
+    assert!(verified.load(Ordering::Relaxed) > 0);
 }

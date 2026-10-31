@@ -11,10 +11,18 @@ pub enum StunAttributeType {
     MappedAddress = 0x0001,
     /// CHANGE-REQUEST attribute (RFC 5780)
     ChangeRequest = 0x0003,
+    /// USERNAME attribute (RFC 5389)
+    Username = 0x0006,
+    /// MESSAGE-INTEGRITY attribute (RFC 5389)
+    MessageIntegrity = 0x0008,
     /// ERROR-CODE attribute (RFC 5389)
     ErrorCode = 0x0009,
     /// UNKNOWN-ATTRIBUTES attribute (RFC 5389)
     UnknownAttributes = 0x000A,
+    /// REALM attribute (RFC 5389)
+    Realm = 0x0014,
+    /// NONCE attribute (RFC 5389)
+    Nonce = 0x0015,
     /// XOR-MAPPED-ADDRESS attribute (RFC 5389)
     XorMappedAddress = 0x0020,
     /// PADDING attribute (RFC 5780)
@@ -23,12 +31,16 @@ pub enum StunAttributeType {
     ResponsePort = 0x0027,
     /// SOFTWARE attribute (RFC 5389)
     Software = 0x8022,
+    /// ALTERNATE-SERVER attribute (RFC 5389)
+    AlternateServer = 0x8023,
     /// CACHE-TIMEOUT attribute (RFC 5780)
     CacheTimeout = 0x8027,
     /// RESPONSE-ORIGIN attribute (RFC 5780)
     ResponseOrigin = 0x802B,
     /// OTHER-ADDRESS attribute (RFC 5780)
     OtherAddress = 0x802C,
+    /// FINGERPRINT attribute (RFC 5389)
+    Fingerprint = 0x8028,
     /// Unknown attribute (for attributes we don't parse but can skip)
     Unknown = 0xFFFF,
 }
@@ -39,13 +51,19 @@ impl StunAttributeType {
         match value {
             0x0001 => StunAttributeType::MappedAddress,
             0x0003 => StunAttributeType::ChangeRequest,
+            0x0006 => StunAttributeType::Username,
+            0x0008 => StunAttributeType::MessageIntegrity,
             0x0009 => StunAttributeType::ErrorCode,
             0x000A => StunAttributeType::UnknownAttributes,
+            0x0014 => StunAttributeType::Realm,
+            0x0015 => StunAttributeType::Nonce,
             0x0020 => StunAttributeType::XorMappedAddress,
             0x0026 => StunAttributeType::Padding,
             0x0027 => StunAttributeType::ResponsePort,
             0x8022 => StunAttributeType::Software,
+            0x8023 => StunAttributeType::AlternateServer,
             0x8027 => StunAttributeType::CacheTimeout,
+            0x8028 => StunAttributeType::Fingerprint,
             0x802B => StunAttributeType::ResponseOrigin,
             0x802C => StunAttributeType::OtherAddress,
             _ => StunAttributeType::Unknown,
@@ -200,6 +218,64 @@ mod tests {
         assert!(!is_comprehension_required(0x8000));
         assert!(!is_comprehension_required(0x8022));
         assert!(!is_comprehension_required(0xFFFF));
+    }
+
+    #[test]
+    fn test_rfc5389_attribute_registry() {
+        let expected = [
+            (0x0006u16, StunAttributeType::Username),
+            (0x0008, StunAttributeType::MessageIntegrity),
+            (0x0014, StunAttributeType::Realm),
+            (0x0015, StunAttributeType::Nonce),
+            (0x8022, StunAttributeType::Software),
+            (0x8023, StunAttributeType::AlternateServer),
+            (0x8028, StunAttributeType::Fingerprint),
+            (0x0001, StunAttributeType::MappedAddress),
+            (0x0009, StunAttributeType::ErrorCode),
+            (0x000A, StunAttributeType::UnknownAttributes),
+            (0x0020, StunAttributeType::XorMappedAddress),
+            (0x0003, StunAttributeType::ChangeRequest),
+            (0x0026, StunAttributeType::Padding),
+            (0x0027, StunAttributeType::ResponsePort),
+            (0x8027, StunAttributeType::CacheTimeout),
+            (0x802B, StunAttributeType::ResponseOrigin),
+            (0x802C, StunAttributeType::OtherAddress),
+        ];
+
+        for (raw, expected_type) in expected {
+            assert_eq!(StunAttributeType::from_raw(raw), expected_type);
+        }
+    }
+
+    #[test]
+    fn test_rfc5389_auth_attribute_wire_codes() {
+        assert_eq!(StunAttributeType::Username as u16, 0x0006);
+        assert_eq!(StunAttributeType::MessageIntegrity as u16, 0x0008);
+        assert_eq!(StunAttributeType::Realm as u16, 0x0014);
+        assert_eq!(StunAttributeType::Nonce as u16, 0x0015);
+        assert_eq!(StunAttributeType::Software as u16, 0x8022);
+        assert_eq!(StunAttributeType::AlternateServer as u16, 0x8023);
+        assert_eq!(StunAttributeType::Fingerprint as u16, 0x8028);
+    }
+
+    #[test]
+    fn test_rfc5389_registry_distinguishes_unknown() {
+        assert_eq!(
+            StunAttributeType::from_raw(0x0024),
+            StunAttributeType::Unknown
+        );
+        assert_eq!(
+            StunAttributeType::from_raw(0x0002),
+            StunAttributeType::Unknown
+        );
+    }
+
+    #[test]
+    fn test_comprehension_required_boundary_is_exact() {
+        assert!(is_comprehension_required(0x7FFF));
+        assert!(!is_comprehension_required(0x8000));
+        assert!(is_comprehension_required(0x0008));
+        assert!(!is_comprehension_required(0x8028));
     }
 
     #[test]

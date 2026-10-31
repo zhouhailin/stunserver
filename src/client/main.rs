@@ -4,7 +4,7 @@
 //! Sends a STUN Binding Request and displays the mapped address.
 
 use chrono::Local;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::io::Write;
 use std::process;
 use std::time::Duration;
@@ -13,6 +13,24 @@ use stunclient::{
     client,
     metadata::BuildMetadata,
 };
+
+/// Credential mode requested on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AuthModeArg {
+    Disabled,
+    ShortTerm,
+    LongTerm,
+}
+
+impl From<AuthModeArg> for client::AuthMode {
+    fn from(mode: AuthModeArg) -> Self {
+        match mode {
+            AuthModeArg::Disabled => client::AuthMode::Disabled,
+            AuthModeArg::ShortTerm => client::AuthMode::ShortTerm,
+            AuthModeArg::LongTerm => client::AuthMode::LongTerm,
+        }
+    }
+}
 
 /// Command-line arguments for stunclient.
 #[derive(Parser, Debug)]
@@ -51,6 +69,19 @@ struct Args {
     /// Use only IPv6 addresses.
     #[arg(short = '6', long = "ipv6-only", conflicts_with = "ipv4_only")]
     ipv6_only: bool,
+
+    /// Credential mode: disabled, short-term, or long-term.
+    #[arg(long, value_enum, default_value = "disabled")]
+    auth_mode: AuthModeArg,
+
+    /// Username for short-term or long-term credentials.
+    #[arg(long)]
+    username: Option<String>,
+
+    /// Password for short-term or long-term credentials. Visible in process
+    /// listings; prefer the STUNCLIENT_PASSWORD environment variable.
+    #[arg(long)]
+    password: Option<String>,
 }
 
 fn main() {
@@ -95,6 +126,17 @@ fn main() {
     let resolved_addrs = network_addr.resolved_addrs.clone();
     let primary_addr = network_addr.primary_address().unwrap();
 
+    let auth = match resolve_auth(&args, std::env::var("STUNCLIENT_PASSWORD").ok().as_deref()) {
+        Ok(auth) => auth,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+    if let Some(warning) = password_warning(&args) {
+        log::warn!("{}", warning);
+    }
+
     println!("Sending binding request to {}...", network_addr);
     if resolved_addrs.len() > 1 {
         log::info!(
@@ -118,9 +160,10 @@ fn main() {
     let timeout = Duration::from_secs(args.timeout);
 
     // Try addresses with fallback.
-    let result = runtime.block_on(client::send_binding_request_with_fallback(
+    let result = runtime.block_on(client::send_binding_request_with_fallback_and_auth(
         &resolved_addrs,
         timeout,
+        &auth,
     ));
 
     match result {
@@ -148,6 +191,54 @@ fn main() {
             }
         }
     }
+}
+
+/// Build client credentials from CLI flags plus the optional env-var password.
+fn resolve_auth(args: &Args, env_password: Option<&str>) -> Result<client::ClientAuth, String> {
+    match args.auth_mode {
+        AuthModeArg::Disabled => {
+            if args.username.is_some() || args.password.is_some() {
+                return Err(
+                    "--username/--password require --auth-mode short-term or long-term".to_string(),
+                );
+            }
+            Ok(client::ClientAuth::disabled())
+        }
+        AuthModeArg::ShortTerm | AuthModeArg::LongTerm => {
+            let username = args
+                .username
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    "--username is required when authentication is enabled".to_string()
+                })?;
+            let password = args
+                .password
+                .as_deref()
+                .or(env_password)
+                .filter(|secret| !secret.is_empty())
+                .ok_or_else(|| {
+                    "--password or STUNCLIENT_PASSWORD is required when authentication is enabled"
+                        .to_string()
+                })?;
+            let mode = client::AuthMode::from(args.auth_mode);
+            Ok(match mode {
+                client::AuthMode::ShortTerm => client::ClientAuth::short_term(username, password),
+                client::AuthMode::LongTerm => client::ClientAuth::long_term(username, password),
+                client::AuthMode::Disabled => client::ClientAuth::disabled(),
+            })
+        }
+    }
+}
+
+/// Warn that `--password` leaks through process listings when debug logging is on.
+fn password_warning(args: &Args) -> Option<String> {
+    if !args.debug || args.password.is_none() {
+        return None;
+    }
+    Some(
+        "--password is visible in process listings; prefer STUNCLIENT_PASSWORD instead".to_string(),
+    )
 }
 
 /// Initialize console logging with the same format as the server.
@@ -221,5 +312,123 @@ mod tests {
         let help = Args::command().render_help().to_string();
         assert!(help.contains("--trace"));
         assert!(help.contains("prints raw packet bytes"));
+    }
+
+    #[test]
+    fn test_auth_mode_defaults_to_disabled() {
+        let args = parse(&["stunclient"]);
+        assert_eq!(args.auth_mode, AuthModeArg::Disabled);
+    }
+
+    #[test]
+    fn test_auth_mode_accepts_short_term_and_long_term() {
+        let short = parse(&["stunclient", "--auth-mode", "short-term"]);
+        assert_eq!(short.auth_mode, AuthModeArg::ShortTerm);
+        let long = parse(&["stunclient", "--auth-mode", "long-term"]);
+        assert_eq!(long.auth_mode, AuthModeArg::LongTerm);
+    }
+
+    #[test]
+    fn test_auth_mode_rejects_unknown_value() {
+        assert!(Args::try_parse_from(["stunclient", "--auth-mode", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_requires_username() {
+        let args = parse(&[
+            "stunclient",
+            "--auth-mode",
+            "short-term",
+            "--password",
+            "s3cret",
+        ]);
+        assert!(resolve_auth(&args, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_requires_password() {
+        let args = parse(&[
+            "stunclient",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+        ]);
+        assert!(resolve_auth(&args, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_prefers_password_flag_over_env() {
+        let args = parse(&[
+            "stunclient",
+            "--auth-mode",
+            "short-term",
+            "--username",
+            "alice",
+            "--password",
+            "from-flag",
+        ]);
+        let auth = resolve_auth(&args, Some("from-env")).unwrap();
+        assert_eq!(auth.mode(), client::AuthMode::ShortTerm);
+        assert_eq!(auth.username(), Some("alice"));
+        assert_eq!(auth.password(), Some("from-flag"));
+    }
+
+    #[test]
+    fn test_resolve_auth_reads_password_from_env() {
+        let args = parse(&[
+            "stunclient",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+        ]);
+        let auth = resolve_auth(&args, Some("from-env")).unwrap();
+        assert_eq!(auth.mode(), client::AuthMode::LongTerm);
+        assert_eq!(auth.password(), Some("from-env"));
+    }
+
+    #[test]
+    fn test_resolve_auth_rejects_credentials_with_disabled() {
+        let args = parse(&["stunclient", "--username", "alice", "--password", "s3cret"]);
+        assert!(resolve_auth(&args, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_disabled_has_no_credentials() {
+        let args = parse(&["stunclient"]);
+        let auth = resolve_auth(&args, None).unwrap();
+        assert_eq!(auth.mode(), client::AuthMode::Disabled);
+        assert_eq!(auth.username(), None);
+        assert_eq!(auth.password(), None);
+    }
+
+    #[test]
+    fn test_debug_password_warning_mentions_process_listing_and_env_var() {
+        let args = parse(&[
+            "stunclient",
+            "--debug",
+            "--auth-mode",
+            "short-term",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+        ]);
+        let warning = password_warning(&args).expect("warning should be emitted");
+        assert!(warning.contains("process"));
+        assert!(warning.contains("STUNCLIENT_PASSWORD"));
+
+        let quiet_args = parse(&["stunclient"]);
+        assert!(password_warning(&quiet_args).is_none());
+    }
+
+    #[test]
+    fn test_help_documents_auth_options() {
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("--auth-mode"));
+        assert!(help.contains("--username"));
+        assert!(help.contains("--password"));
+        assert!(help.contains("STUNCLIENT_PASSWORD"));
     }
 }

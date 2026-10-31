@@ -4,9 +4,11 @@
 //! requests by responding with XOR-MAPPED-ADDRESS containing the client's
 //! reflexive address.
 
+use crate::auth::{AuthOutcome, AuthService};
 use crate::config::ServerConfig;
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +23,132 @@ use tokio::sync::Notify;
 /// Size of the pre-allocated receive buffer (64 KB, well above STUN max).
 const RECV_BUF_SIZE: usize = 65536;
 
+/// SOFTWARE attribute value, identical across every response.
+pub const SOFTWARE: &str = concat!("stunserver ", env!("CARGO_PKG_VERSION"));
+
+/// Reason a datagram is silently discarded before authentication.
+///
+/// The variants carry lengths and type codes only; raw payload bytes and
+/// secrets are never included (FR-013, FR-033).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntakeRejection {
+    /// The datagram could not be decoded; the message names lengths or header
+    /// fields only.
+    Decode(String),
+    /// The message is not a Binding Request.
+    NotBindingRequest,
+    /// FINGERPRINT is duplicated, non-final, or has a bad CRC.
+    Fingerprint {
+        attribute_type: u16,
+        value_len: usize,
+        reason: &'static str,
+    },
+    /// MESSAGE-INTEGRITY is duplicated or has the wrong length.
+    MessageIntegrity {
+        attribute_type: u16,
+        value_len: usize,
+        reason: &'static str,
+    },
+}
+
+impl fmt::Display for IntakeRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decode(reason) => write!(f, "malformed message: {reason}"),
+            Self::NotBindingRequest => write!(f, "not a Binding Request"),
+            Self::Fingerprint {
+                attribute_type,
+                value_len,
+                reason,
+            } => write!(
+                f,
+                "FINGERPRINT(0x{attribute_type:04X}, len={value_len}): {reason}"
+            ),
+            Self::MessageIntegrity {
+                attribute_type,
+                value_len,
+                reason,
+            } => write!(
+                f,
+                "MESSAGE-INTEGRITY(0x{attribute_type:04X}, len={value_len}): {reason}"
+            ),
+        }
+    }
+}
+
+/// Validate a datagram up to, but not including, the authentication stage.
+///
+/// Pipeline order (FR-008-FR-013): header decode and Binding Request check,
+/// then FINGERPRINT position/length/CRC, then MESSAGE-INTEGRITY length and
+/// uniqueness. Returns the decoded request when it may be processed further.
+pub(crate) fn intake(encoded: &[u8]) -> Result<StunMessage, IntakeRejection> {
+    let message =
+        StunMessage::decode(encoded).map_err(|error| IntakeRejection::Decode(error.to_string()))?;
+
+    if message.message_type != StunMessageType::Request {
+        return Err(IntakeRejection::NotBindingRequest);
+    }
+
+    let fingerprint_type = StunAttributeType::Fingerprint as u16;
+    let fingerprint_count = message.attribute_count(fingerprint_type);
+    if fingerprint_count > 0 {
+        let value_len = message
+            .attributes
+            .iter()
+            .find(|attr| attr.raw_type == fingerprint_type)
+            .map(|attr| attr.attribute_value.len())
+            .unwrap_or(0);
+        if fingerprint_count > 1 {
+            return Err(IntakeRejection::Fingerprint {
+                attribute_type: fingerprint_type,
+                value_len,
+                reason: "duplicate attribute",
+            });
+        }
+        if message.attributes.last().map(|attr| attr.raw_type) != Some(fingerprint_type) {
+            return Err(IntakeRejection::Fingerprint {
+                attribute_type: fingerprint_type,
+                value_len,
+                reason: "not the final attribute",
+            });
+        }
+        if !StunMessage::verify_message_fingerprint(encoded) {
+            return Err(IntakeRejection::Fingerprint {
+                attribute_type: fingerprint_type,
+                value_len,
+                reason: "CRC mismatch",
+            });
+        }
+    }
+
+    let integrity_type = StunAttributeType::MessageIntegrity as u16;
+    let integrity_count = message.attribute_count(integrity_type);
+    if integrity_count > 0 {
+        let value_len = message
+            .attributes
+            .iter()
+            .find(|attr| attr.raw_type == integrity_type)
+            .map(|attr| attr.attribute_value.len())
+            .unwrap_or(0);
+        if integrity_count > 1 {
+            return Err(IntakeRejection::MessageIntegrity {
+                attribute_type: integrity_type,
+                value_len,
+                reason: "duplicate attribute",
+            });
+        }
+        if value_len != stun_protocol::integrity::MESSAGE_INTEGRITY_LEN {
+            return Err(IntakeRejection::MessageIntegrity {
+                attribute_type: integrity_type,
+                value_len,
+                reason: "value must be 20 bytes",
+            });
+        }
+    }
+
+    Ok(message)
+}
+
 /// Runtime server state shared across all request handler tasks.
 pub struct ServerState {
     /// Server startup timestamp (UTC).
@@ -31,17 +159,25 @@ pub struct ServerState {
     pub request_count: AtomicU64,
     /// Total errors encountered.
     pub error_count: AtomicU64,
+    /// Authentication stage configuration and precomputed keys.
+    pub auth: Arc<AuthService>,
 }
 
 impl ServerState {
-    /// Create a new server state with counters initialized to zero.
+    /// Create a new server state with authentication disabled.
     pub fn new() -> Self {
+        Self::with_auth(AuthService::disabled())
+    }
+
+    /// Create a new server state with an explicit authentication service.
+    pub fn with_auth(auth: AuthService) -> Self {
         let timezone = chrono::Local::now().offset().to_string();
         Self {
             start_time: Utc::now(),
             timezone,
             request_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
+            auth: Arc::new(auth),
         }
     }
 }
@@ -64,7 +200,8 @@ impl ServerState {
     }
 }
 
-/// Process a single STUN request and produce a response buffer.
+/// Process a single STUN request and produce a response buffer with
+/// authentication disabled.
 ///
 /// Parses the incoming UDP payload as a STUN Binding Request, validates it,
 /// and constructs a Success Response with XOR-MAPPED-ADDRESS reflecting
@@ -72,13 +209,47 @@ impl ServerState {
 ///
 /// Returns `None` if the request is invalid (not a STUN message, wrong type, etc.).
 pub fn build_response(buf: &[u8], client_addr: SocketAddr) -> Option<Vec<u8>> {
-    let request = StunMessage::decode(buf).ok()?;
+    build_response_with_auth(buf, client_addr, &AuthService::disabled())
+}
 
-    if request.message_type != StunMessageType::Request {
-        return None;
+/// Process a single STUN request under the configured authentication stage.
+pub fn build_response_with_auth(
+    buf: &[u8],
+    client_addr: SocketAddr,
+    auth: &AuthService,
+) -> Option<Vec<u8>> {
+    let request = intake(buf).ok()?;
+    Some(build_response_bytes(buf, &request, client_addr, auth).1)
+}
+
+/// Build the response message and its wire bytes for a decoded Binding Request.
+fn build_response_bytes(
+    encoded: &[u8],
+    request: &StunMessage,
+    client_addr: SocketAddr,
+    auth: &AuthService,
+) -> (StunMessage, Vec<u8>) {
+    match auth.authenticate(encoded, request) {
+        AuthOutcome::Rejected {
+            status,
+            challenge,
+            reason,
+        } => {
+            debug!("Authentication rejected for {}: {}", client_addr, reason);
+            let response = build_auth_error_response(request, status, challenge, auth);
+            let bytes = response.encode();
+            (response, bytes)
+        }
+        AuthOutcome::Authenticated(key) => {
+            let response = response_for_request(request, client_addr);
+            sign_response(response, &key)
+        }
+        AuthOutcome::Disabled => {
+            let response = response_for_request(request, client_addr);
+            let bytes = response.encode();
+            (response, bytes)
+        }
     }
-
-    Some(response_for_request(&request, client_addr).encode())
 }
 
 /// Build the response for a decoded Binding Request.
@@ -96,13 +267,98 @@ pub(crate) fn response_for_request(request: &StunMessage, client_addr: SocketAdd
     }
 }
 
-/// Collect comprehension-required attribute types no handler supports,
+/// Append SOFTWARE to a response.
+fn add_software(response: &mut StunMessage) {
+    response.add_attribute(StunAttribute::new(
+        StunAttributeType::Software,
+        SOFTWARE.as_bytes().to_vec(),
+    ));
+}
+
+/// Append a terminal MESSAGE-INTEGRITY attribute and compute its digest.
+fn sign_response(mut response: StunMessage, key: &[u8]) -> (StunMessage, Vec<u8>) {
+    response.add_attribute(StunAttribute::new(
+        StunAttributeType::MessageIntegrity,
+        vec![0u8; stun_protocol::integrity::MESSAGE_INTEGRITY_LEN],
+    ));
+    let mi_offset = *response
+        .attribute_offsets()
+        .last()
+        .expect("MESSAGE-INTEGRITY attribute is present");
+    let mut bytes = response.encode();
+    let digest = stun_protocol::integrity::hmac_sha1(
+        key,
+        &stun_protocol::integrity::hmac_input(&bytes, mi_offset),
+    );
+    bytes[mi_offset + 4..mi_offset + 4 + stun_protocol::integrity::MESSAGE_INTEGRITY_LEN]
+        .copy_from_slice(&digest);
+    (response, bytes)
+}
+
+/// Build a 400/401/438 error response. When `challenge` is set the response
+/// carries REALM and NONCE; no failure response is ever signed.
+fn build_auth_error_response(
+    request: &StunMessage,
+    status: u16,
+    challenge: bool,
+    auth: &AuthService,
+) -> StunMessage {
+    let mut response = StunMessage::new(StunMessageType::ErrorIndication, request.transaction_id);
+
+    let reason = match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        438 => "Stale Nonce",
+        _ => "Error",
+    };
+    let code = ErrorCode::new(4, (status % 100) as u8, reason.to_string());
+    response.add_attribute(StunAttribute::new(
+        StunAttributeType::ErrorCode,
+        code.encode_value(),
+    ));
+
+    if challenge {
+        response.add_attribute(StunAttribute::new(
+            StunAttributeType::Realm,
+            auth.realm().as_bytes().to_vec(),
+        ));
+        response.add_attribute(StunAttribute::new(
+            StunAttributeType::Nonce,
+            auth.issue_nonce().into_bytes(),
+        ));
+    }
+
+    add_software(&mut response);
+    response
+}
+
+/// RFC 5780 behavior-discovery attributes this single-address server rejects.
+const REJECTED_REQUIRED: &[u16] = &[
+    StunAttributeType::ChangeRequest as u16,
+    StunAttributeType::Padding as u16,
+    StunAttributeType::ResponsePort as u16,
+];
+
+/// Collect comprehension-required attribute types this server cannot honor,
 /// preserving first-seen order and de-duplicating.
+///
+/// Known attributes (including authentication attributes and the
+/// not-acted-upon MAPPED-ADDRESS, ERROR-CODE, UNKNOWN-ATTRIBUTES, and
+/// ALTERNATE-SERVER) are ignored. Attributes after MESSAGE-INTEGRITY are
+/// excluded from classification (RFC 5389 §15.4).
 fn unsupported_required_attributes(request: &StunMessage) -> Vec<u16> {
     let mut types: Vec<u16> = Vec::new();
 
     for attr in &request.attributes {
-        if is_comprehension_required(attr.raw_type) && !types.contains(&attr.raw_type) {
+        if attr.raw_type == StunAttributeType::MessageIntegrity as u16 {
+            break;
+        }
+        if !is_comprehension_required(attr.raw_type) {
+            continue;
+        }
+        let recognized = StunAttributeType::from_raw(attr.raw_type) != StunAttributeType::Unknown;
+        let rejected = REJECTED_REQUIRED.contains(&attr.raw_type) || !recognized;
+        if rejected && !types.contains(&attr.raw_type) {
             types.push(attr.raw_type);
         }
     }
@@ -126,6 +382,7 @@ fn build_unknown_attribute_response(request: &StunMessage, unknown: Vec<u16>) ->
         list.encode_value(),
     ));
 
+    add_software(&mut response);
     response
 }
 
@@ -138,6 +395,7 @@ fn build_success_response(request: &StunMessage, client_addr: SocketAddr) -> Stu
     let xor_value = mapped.encode_xor(request.magic_cookie, &request.transaction_id);
     let attr = StunAttribute::new(StunAttributeType::XorMappedAddress, xor_value);
     response.add_attribute(attr);
+    add_software(&mut response);
 
     response
 }
@@ -184,25 +442,32 @@ pub async fn run_server(
                         tokio::spawn(async move {
                             state.inc_requests();
                             debug!("Request from {} ({} bytes)", client_addr, len);
-                            trace!("Received: {:02x?}", data);
 
-                            match StunMessage::decode(&data) {
-                                Ok(request) if request.message_type == StunMessageType::Request => {
+                            match intake(&data) {
+                                Ok(request) => {
+                                    trace!("Received: {:02x?}", data);
                                     debug!("Received: {}", describe_message(&request));
 
-                                    let response_msg = response_for_request(&request, client_addr);
+                                    let (response_msg, response) = build_response_bytes(
+                                        &data,
+                                        &request,
+                                        client_addr,
+                                        &state.auth,
+                                    );
                                     debug!("Response: {}", describe_message(&response_msg));
 
-                                    let response = response_msg.encode();
                                     trace!("Response: {:02x?}", response);
                                     if let Err(e) = sock.send_to(&response, client_addr).await {
                                         state.inc_errors();
                                         warn!("Failed to send response to {}: {}", client_addr, e);
                                     }
                                 }
-                                _ => {
+                                Err(reason) => {
                                     state.inc_errors();
-                                    debug!("Invalid STUN request from {}", client_addr);
+                                    debug!(
+                                        "Discarded {} byte message from {}: {}",
+                                        len, client_addr, reason
+                                    );
                                 }
                             }
                         });
@@ -278,10 +543,14 @@ mod tests {
         let response = StunMessage::decode(&response_bytes).unwrap();
         assert_eq!(response.message_type, StunMessageType::Response);
         assert_eq!(response.transaction_id, transaction_id);
-        assert_eq!(response.attributes.len(), 1);
+        assert_eq!(response.attributes.len(), 2);
         assert_eq!(
             response.attributes[0].attribute_type,
             StunAttributeType::XorMappedAddress
+        );
+        assert_eq!(
+            response.attributes[1].attribute_type,
+            StunAttributeType::Software
         );
 
         // Decode the XOR-MAPPED-ADDRESS and verify it matches client address.
@@ -551,7 +820,7 @@ mod tests {
         assert_eq!(response.message_type, StunMessageType::ErrorIndication);
         assert_eq!(response.transaction_id, transaction_id);
         assert_eq!(response.magic_cookie, request.magic_cookie);
-        assert_eq!(response.attributes.len(), 2);
+        assert_eq!(response.attributes.len(), 3);
         assert_eq!(
             response.attributes[0].attribute_type,
             StunAttributeType::ErrorCode
@@ -561,6 +830,10 @@ mod tests {
             StunAttributeType::UnknownAttributes
         );
         assert_eq!(response.attributes[1].raw_type, 0x000A);
+        assert_eq!(
+            response.attributes[2].attribute_type,
+            StunAttributeType::Software
+        );
         assert!(response
             .attributes
             .iter()
@@ -609,10 +882,14 @@ mod tests {
         let response = StunMessage::decode(&response_bytes).unwrap();
 
         assert_eq!(response.message_type, StunMessageType::Response);
-        assert_eq!(response.attributes.len(), 1);
+        assert_eq!(response.attributes.len(), 2);
         assert_eq!(
             response.attributes[0].attribute_type,
             StunAttributeType::XorMappedAddress
+        );
+        assert_eq!(
+            response.attributes[1].attribute_type,
+            StunAttributeType::Software
         );
     }
 
