@@ -25,6 +25,7 @@ env_logger.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+flate2.workspace = true
 stun-protocol = { path = "../../crates/stun-protocol" }
 
 [dev-dependencies]

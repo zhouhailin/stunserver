@@ -44,6 +44,9 @@ dist/
 test-logs/
 test-config/
 
+# Local configuration copied from deploy/stunserver.conf.example
+config/stunserver.conf
+
 # Rust build artifacts and editor temporaries
 *.rlib
 *.prof*

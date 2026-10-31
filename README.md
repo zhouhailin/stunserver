@@ -90,6 +90,7 @@ file_prefix = "stunserver"
 max_file_size_mb = 100
 retention_days = 30
 enable_console = true
+compress_rotated_logs = true  # gzip rotated files into *.gz
 
 [network]
 udp_recv_buffer_size = 1048576

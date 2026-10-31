@@ -1,13 +1,16 @@
 //! Logging initialization for STUN Server.
 //!
 //! Supports console output and file output with daily rotation,
-//! size-based rotation, and configurable file retention.
+//! size-based rotation, optional gzip compression of rotated files,
+//! and configurable file retention.
 
 use crate::config::LoggingConfig;
 use chrono::Local;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Format a timestamp with millisecond precision.
@@ -29,6 +32,8 @@ struct FileLogger {
     current_date: String,
     /// Current approximate file size (tracked without stat calls).
     current_size: u64,
+    /// Whether rotated files are gzip-compressed.
+    compress_rotated: bool,
 }
 
 impl FileLogger {
@@ -56,6 +61,7 @@ impl FileLogger {
             max_files: config.retention_days,
             current_date,
             current_size,
+            compress_rotated: config.compress_rotated_logs,
         })
     }
 
@@ -87,8 +93,9 @@ impl FileLogger {
         Ok(())
     }
 
-    /// Rotate the current log file to `{path}.{date}.{sequence}`, open a fresh
-    /// file, and prune old files exceeding `max_files`.
+    /// Rotate the current log file to `{path}.{date}.{sequence}` (optionally
+    /// gzip-compressed), open a fresh file, and prune old files exceeding
+    /// `max_files`.
     fn rotate(&mut self, date_suffix: &str) -> Result<(), std::io::Error> {
         // Close current file by dropping, then rename.
         drop(std::mem::replace(
@@ -97,11 +104,13 @@ impl FileLogger {
         ));
 
         // Pick the first free sequence number for this date; never overwrite.
+        // Both plain and compressed names are considered so switching the
+        // compression setting cannot collide with existing archives.
         let mut seq = 1u32;
         let final_rotated = loop {
             let candidate =
                 PathBuf::from(format!("{}.{}.{}", self.path.display(), date_suffix, seq));
-            if !candidate.exists() {
+            if !candidate.exists() && !compressed_path(&candidate).exists() {
                 break candidate;
             }
             seq += 1;
@@ -109,6 +118,11 @@ impl FileLogger {
 
         // Rename current log to rotated name (ignore error if source doesn't exist).
         let _ = fs::rename(&self.path, &final_rotated);
+
+        if self.compress_rotated {
+            // Best effort: on failure keep the uncompressed rotated file.
+            let _ = compress_file(&final_rotated);
+        }
 
         // Open a fresh log file.
         self.file = OpenOptions::new()
@@ -162,6 +176,37 @@ impl FileLogger {
         }
 
         Ok(())
+    }
+}
+
+/// Append `.gz` to a path without replacing its existing extension.
+fn compressed_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".gz");
+    PathBuf::from(name)
+}
+
+/// Compress `path` into `path.gz`, removing the original on success.
+fn compress_file(path: &Path) -> std::io::Result<()> {
+    let compressed = compressed_path(path);
+    let result: std::io::Result<()> = (|| {
+        let mut input = File::open(path)?;
+        let output = File::create(&compressed)?;
+        let mut encoder = GzEncoder::new(output, Compression::default());
+        std::io::copy(&mut input, &mut encoder)?;
+        encoder.finish()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&compressed);
+            Err(e)
+        }
     }
 }
 
@@ -242,6 +287,7 @@ mod tests {
             max_file_size_mb: 1,
             retention_days: 3,
             enable_console: false,
+            compress_rotated_logs: false,
         }
     }
 
@@ -561,6 +607,14 @@ mod tests {
         contents
     }
 
+    fn read_gzip(path: &std::path::Path) -> String {
+        let mut contents = String::new();
+        flate2::read::GzDecoder::new(File::open(path).unwrap())
+            .read_to_string(&mut contents)
+            .unwrap();
+        contents
+    }
+
     fn write_info(logger: &mut FileLogger, message: &str) {
         logger
             .write_log(
@@ -674,6 +728,116 @@ mod tests {
         File::create(dir.join(format!("test.log.{}.1", today))).unwrap();
         File::create(dir.join(format!("test.log.{}.2", today))).unwrap();
         File::create(dir.join(format!("test.log.{}.3", today))).unwrap();
+        File::create(&log_path).unwrap();
+
+        let logger = FileLogger::new(&config).unwrap();
+        logger.prune_old_files().unwrap();
+
+        let rotated_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("test.log.") && name != "test.log"
+            })
+            .count();
+
+        assert!(
+            rotated_count <= config.retention_days as usize,
+            "expected <= {} rotated files, got {}",
+            config.retention_days,
+            rotated_count
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rotate_compresses_rotated_file() {
+        let dir = std::env::temp_dir().join("stunserver_test_rotate_gzip");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut config = test_logging_config(&dir);
+        config.compress_rotated_logs = true;
+        let mut logger = FileLogger::new(&config).unwrap();
+        logger.max_size = 10;
+
+        write_info(&mut logger, "first message");
+        write_info(&mut logger, "second message");
+
+        let plain = dir.join(format!("test.log.{}.1", today_string()));
+        let compressed = dir.join(format!("test.log.{}.1.gz", today_string()));
+        assert!(!plain.exists(), "plain file should be removed");
+        assert!(compressed.exists(), "expected {}", compressed.display());
+        assert!(read_gzip(&compressed).contains("first message"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rotate_keeps_plain_file_when_compression_disabled() {
+        let dir = std::env::temp_dir().join("stunserver_test_rotate_no_gzip");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let config = test_logging_config(&dir);
+        assert!(!config.compress_rotated_logs);
+        let mut logger = FileLogger::new(&config).unwrap();
+        logger.max_size = 10;
+
+        write_info(&mut logger, "first message");
+        write_info(&mut logger, "second message");
+
+        let plain = dir.join(format!("test.log.{}.1", today_string()));
+        let compressed = dir.join(format!("test.log.{}.1.gz", today_string()));
+        assert!(plain.exists(), "expected {}", plain.display());
+        assert!(read_file(&plain).contains("first message"));
+        assert!(!compressed.exists(), "unexpected {}", compressed.display());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rotate_sequence_skips_existing_compressed_file() {
+        let dir = std::env::temp_dir().join("stunserver_test_rotate_gzip_sequence");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let today = today_string();
+        let existing = dir.join(format!("test.log.{}.1.gz", today));
+        fs::write(&existing, "sentinel").unwrap();
+
+        let mut config = test_logging_config(&dir);
+        config.compress_rotated_logs = true;
+        let mut logger = FileLogger::new(&config).unwrap();
+        logger.max_size = 10;
+
+        write_info(&mut logger, "first message");
+        write_info(&mut logger, "second message");
+
+        let second = dir.join(format!("test.log.{}.2.gz", today));
+        assert!(second.exists(), "expected {}", second.display());
+        assert!(read_gzip(&second).contains("first message"));
+        assert_eq!(read_file(&existing), "sentinel");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_counts_compressed_files() {
+        let dir = std::env::temp_dir().join("stunserver_test_prune_gzip");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let config = test_logging_config(&dir);
+        let log_path = config.log_file_path();
+        let today = today_string();
+
+        File::create(dir.join(format!("test.log.{}.1", today))).unwrap();
+        File::create(dir.join(format!("test.log.{}.2.gz", today))).unwrap();
+        File::create(dir.join(format!("test.log.{}.3.gz", today))).unwrap();
+        File::create(dir.join(format!("test.log.{}.4.gz", today))).unwrap();
         File::create(&log_path).unwrap();
 
         let logger = FileLogger::new(&config).unwrap();

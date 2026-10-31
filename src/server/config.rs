@@ -52,6 +52,10 @@ fn default_enable_console() -> bool {
     true
 }
 
+fn default_compress_rotated_logs() -> bool {
+    true
+}
+
 fn default_udp_recv_buffer_size() -> usize {
     1048576
 }
@@ -154,6 +158,9 @@ pub struct LoggingConfig {
 
     #[serde(default = "default_enable_console")]
     pub enable_console: bool,
+
+    #[serde(default = "default_compress_rotated_logs")]
+    pub compress_rotated_logs: bool,
 }
 
 impl Default for LoggingConfig {
@@ -165,6 +172,7 @@ impl Default for LoggingConfig {
             max_file_size_mb: default_max_file_size_mb(),
             retention_days: default_retention_days(),
             enable_console: default_enable_console(),
+            compress_rotated_logs: default_compress_rotated_logs(),
         }
     }
 }
@@ -297,6 +305,9 @@ pub enum ConfigError {
     MissingTlsKeyPath,
 }
 
+/// Configuration path loaded when `--config` is not provided.
+pub const DEFAULT_CONFIG_PATH: &str = "config/stunserver.conf";
+
 /// Load configuration from a TOML file.
 ///
 /// Returns the parsed and validated `Config`.
@@ -310,6 +321,23 @@ pub fn load_config(path: &std::path::Path) -> Result<Config, ConfigError> {
 
     validate_config(&config)?;
     Ok(config)
+}
+
+/// Load an explicitly requested config file, or `default_path` when none is given.
+///
+/// A missing `default_path` falls back to the built-in defaults; any other
+/// error, including a missing explicitly requested file, is returned.
+pub fn load_config_or_default(
+    path: Option<&std::path::Path>,
+    default_path: &std::path::Path,
+) -> Result<Config, ConfigError> {
+    match path {
+        Some(path) => load_config(path),
+        None => match load_config(default_path) {
+            Err(ConfigError::FileNotFound(_)) => Ok(default_config()),
+            result => result,
+        },
+    }
 }
 
 /// Build a default configuration (used when no config file is specified).
@@ -383,6 +411,13 @@ mod tests {
         assert_eq!(config.server.port, 3478);
         assert_eq!(config.logging.level, "info");
         assert!(config.logging.enable_console);
+        assert!(config.logging.compress_rotated_logs);
+    }
+
+    #[test]
+    fn test_deserialize_compress_rotated_logs_disabled() {
+        let config: Config = toml::from_str("[logging]\ncompress_rotated_logs = false\n").unwrap();
+        assert!(!config.logging.compress_rotated_logs);
     }
 
     #[test]
@@ -459,6 +494,7 @@ enable_tls = false
             max_file_size_mb: 100,
             retention_days: 30,
             enable_console: true,
+            compress_rotated_logs: true,
         };
         assert_eq!(
             config.log_file_path(),
@@ -475,6 +511,7 @@ enable_tls = false
             max_file_size_mb: 100,
             retention_days: 30,
             enable_console: true,
+            compress_rotated_logs: true,
         };
         assert_eq!(config.max_file_size_bytes(), 100 * 1024 * 1024);
     }
@@ -616,6 +653,77 @@ enable_tls = false
     fn test_load_config_file_not_found() {
         let err = load_config(std::path::Path::new("/nonexistent/config.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::FileNotFound(_)));
+    }
+
+    // --- load_config_or_default tests ---
+
+    fn test_config_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_load_config_or_default_prefers_explicit_path() {
+        let dir = test_config_dir("stunserver_config_explicit");
+        let explicit = dir.join("explicit.toml");
+        let fallback = dir.join("fallback.toml");
+        std::fs::write(&explicit, "[server]\nport = 4001\n").unwrap();
+        std::fs::write(&fallback, "[server]\nport = 4002\n").unwrap();
+
+        let config = load_config_or_default(Some(&explicit), &fallback).unwrap();
+        assert_eq!(config.server.port, 4001);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_config_or_default_uses_default_path() {
+        let dir = test_config_dir("stunserver_config_default");
+        let default_path = dir.join("stunserver.conf");
+        std::fs::write(&default_path, "[server]\nport = 4003\n").unwrap();
+
+        let config = load_config_or_default(None, &default_path).unwrap();
+        assert_eq!(config.server.port, 4003);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_config_or_default_falls_back_when_default_missing() {
+        let dir = test_config_dir("stunserver_config_missing_default");
+        let default_path = dir.join("stunserver.conf");
+
+        let config = load_config_or_default(None, &default_path).unwrap();
+        assert_eq!(config.server.port, Config::default().server.port);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_config_or_default_rejects_missing_explicit_path() {
+        let dir = test_config_dir("stunserver_config_missing_explicit");
+        let default_path = dir.join("stunserver.conf");
+        std::fs::write(&default_path, "[server]\nport = 4004\n").unwrap();
+
+        let err =
+            load_config_or_default(Some(&dir.join("absent.toml")), &default_path).unwrap_err();
+        assert!(matches!(err, ConfigError::FileNotFound(_)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_config_or_default_propagates_malformed_default() {
+        let dir = test_config_dir("stunserver_config_malformed_default");
+        let default_path = dir.join("stunserver.conf");
+        std::fs::write(&default_path, "not valid toml =").unwrap();
+
+        let err = load_config_or_default(None, &default_path).unwrap_err();
+        assert!(matches!(err, ConfigError::TomlError(_)));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

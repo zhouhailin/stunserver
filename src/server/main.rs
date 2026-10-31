@@ -20,7 +20,7 @@ use stunserver::{config, logging, metadata::BuildMetadata, server};
     before_help = BuildMetadata::capture().format_version_line()
 )]
 struct Args {
-    /// Path to TOML configuration file.
+    /// Path to TOML configuration file (default: config/stunserver.conf).
     #[arg(short, long)]
     config: Option<PathBuf>,
 
@@ -45,16 +45,16 @@ fn main() {
     let args = Args::parse();
 
     // Load configuration: CLI args override file values, file overrides defaults.
-    let mut cfg = if let Some(ref config_path) = args.config {
-        match config::load_config(config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                process::exit(1);
-            }
+    // Without --config, config/stunserver.conf is loaded when it exists.
+    let mut cfg = match config::load_config_or_default(
+        args.config.as_deref(),
+        std::path::Path::new(config::DEFAULT_CONFIG_PATH),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
         }
-    } else {
-        config::default_config()
     };
 
     // CLI overrides.
