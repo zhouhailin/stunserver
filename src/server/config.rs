@@ -481,9 +481,11 @@ enable_tls = false
 
     #[test]
     fn test_logging_config_level_filter() {
-        let mut config = LoggingConfig::default();
+        let mut config = LoggingConfig {
+            level: "trace".to_string(),
+            ..Default::default()
+        };
 
-        config.level = "trace".to_string();
         assert_eq!(config.level_filter(), log::LevelFilter::Trace);
 
         config.level = "debug".to_string();
