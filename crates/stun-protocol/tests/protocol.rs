@@ -123,6 +123,26 @@ fn test_attribute_encode_decode() {
 }
 
 #[test]
+fn test_unknown_attribute_preserves_raw_type() {
+    // Attribute with type 0xABCD (not defined by RFC 5389) and a 4-byte value.
+    let raw = [0xAB, 0xCD, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+    let attr = StunAttribute::decode(&raw).unwrap();
+
+    assert_eq!(attr.attribute_type, StunAttributeType::Unknown);
+    assert_eq!(attr.raw_type, 0xABCD);
+
+    // Re-encoding must keep the original wire type instead of 0xFFFF.
+    let encoded = attr.encode();
+    assert_eq!(&encoded[0..2], &[0xAB, 0xCD]);
+}
+
+#[test]
+fn test_known_attribute_raw_type_matches_enum() {
+    let attr = StunAttribute::new(StunAttributeType::Software, b"x".to_vec());
+    assert_eq!(attr.raw_type, 0x8022);
+}
+
+#[test]
 fn test_attribute_padding() {
     // Test 5-byte value (needs 3 bytes padding)
     let value = vec![1, 2, 3, 4, 5];

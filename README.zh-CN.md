@@ -118,8 +118,8 @@ tcp_idle_timeout_sec = 300
 ├── etc/
 │   └── stunserver.conf         # 配置文件
 └── log/
-    ├── stunserver.log          # 当前日志文件
-    └── stunserver.log.1        # 轮转后的日志文件
+    ├── stunserver.log                    # 当前日志文件
+    └── stunserver.log.2026-10-31.1       # 轮转后的日志文件
 ```
 
 ## 管理命令
@@ -204,9 +204,11 @@ services:
 
 日志文件命名规则：
 - `stunserver.log` - 当前活跃日志
-- `stunserver.log.1` - 最近轮转的日志
-- `stunserver.log.2` - 更早的轮转日志
+- `stunserver.log.YYYY-MM-DD.1` - 当天第 1 个轮转日志
+- `stunserver.log.YYYY-MM-DD.2` - 当天第 2 个轮转日志
 - ...
+
+序号每天从 1 开始，不补零，且不会覆盖已有文件。
 
 ## 故障排除
 

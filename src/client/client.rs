@@ -5,7 +5,9 @@
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use stun_protocol::{MappedAddress, StunAttributeType, StunMessage, StunMessageType};
+use stun_protocol::{
+    describe_message, MappedAddress, StunAttributeType, StunMessage, StunMessageType,
+};
 use tokio::net::UdpSocket;
 
 /// Result of a successful STUN binding request.
@@ -60,7 +62,8 @@ pub async fn send_binding_request(
     let request = StunMessage::new(StunMessageType::Request, transaction_id);
     let request_bytes = request.encode();
 
-    log::debug!("Sending: {:02x?}", request_bytes);
+    log::debug!("Sending: {}", describe_message(&request));
+    log::trace!("Sending: {:02x?}", request_bytes);
 
     let start = Instant::now();
 
@@ -79,7 +82,7 @@ pub async fn send_binding_request(
     match recv_result {
         Ok(Ok((len, from_addr))) => {
             log::debug!("Received {} bytes from {}", len, from_addr);
-            log::debug!("Response: {:02x?}", &recv_buf[..len]);
+            log::trace!("Received: {:02x?}", &recv_buf[..len]);
 
             // Verify response came from the expected server.
             if from_addr != server_addr {
@@ -132,13 +135,11 @@ fn parse_response(
     latency: Duration,
 ) -> Result<BindingResponse, ClientError> {
     let response = StunMessage::decode(data).map_err(|e| {
-        log::debug!(
-            "Failed to decode STUN message ({} bytes): {:02x?}",
-            data.len(),
-            &data[..std::cmp::min(data.len(), 40)]
-        );
+        log::debug!("Failed to decode STUN message ({} bytes)", data.len());
         ClientError::Protocol(format!("failed to decode response: {}", e))
     })?;
+
+    log::debug!("Received: {}", describe_message(&response));
 
     // Verify message type is a success response.
     if response.message_type != StunMessageType::Response {

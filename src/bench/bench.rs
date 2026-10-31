@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stun_protocol::{StunMessage, StunMessageType};
+use stun_protocol::{describe_message, StunMessage, StunMessageType};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
@@ -116,7 +116,8 @@ pub async fn run_benchmark(config: &BenchConfig) -> Result<BenchmarkStats, Strin
             let request = StunMessage::new(StunMessageType::Request, transaction_id);
             let request_bytes = request.encode();
 
-            log::debug!("Sending: {:02x?}", request_bytes);
+            log::debug!("Sending: {}", describe_message(&request));
+            log::trace!("Sending: {:02x?}", request_bytes);
 
             match sender_socket.send_to(&request_bytes, server_addr).await {
                 Ok(_) => {
@@ -265,17 +266,23 @@ async fn process_response(
     success: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
 ) {
-    log::debug!("Response: {:02x?}", data);
+    log::trace!("Received: {:02x?}", data);
 
     match StunMessage::decode(data) {
         Ok(response) if response.message_type == StunMessageType::Response => {
+            log::debug!("Received: {}", describe_message(&response));
             // Estimate latency (in a real implementation, we'd track per-request timing).
             let latency = Duration::from_micros(500); // Placeholder.
             let mut guard = latencies.lock().await;
             guard.record_latency(latency);
             success.fetch_add(1, Ordering::Relaxed);
         }
-        _ => {
+        Ok(_) => {
+            log::debug!("Invalid STUN response type ({} bytes)", data.len());
+            failed.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {
+            log::debug!("Failed to decode STUN response ({} bytes)", data.len());
             failed.fetch_add(1, Ordering::Relaxed);
         }
     }

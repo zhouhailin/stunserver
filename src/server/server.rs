@@ -6,12 +6,12 @@
 
 use crate::config::ServerConfig;
 use chrono::Utc;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stun_protocol::{
-    MappedAddress, StunAttribute, StunAttributeType, StunMessage, StunMessageType,
+    describe_message, MappedAddress, StunAttribute, StunAttributeType, StunMessage, StunMessageType,
 };
 use tokio::net::UdpSocket;
 use tokio::signal;
@@ -77,7 +77,11 @@ pub fn build_response(buf: &[u8], client_addr: SocketAddr) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Build success response with same transaction ID.
+    Some(build_response_message(&request, client_addr).encode())
+}
+
+/// Build the Binding Success Response for a decoded request.
+fn build_response_message(request: &StunMessage, client_addr: SocketAddr) -> StunMessage {
     let mut response = StunMessage::new(StunMessageType::Response, request.transaction_id);
 
     // Create XOR-MAPPED-ADDRESS attribute with client's reflexive address.
@@ -86,7 +90,7 @@ pub fn build_response(buf: &[u8], client_addr: SocketAddr) -> Option<Vec<u8>> {
     let attr = StunAttribute::new(StunAttributeType::XorMappedAddress, xor_value);
     response.add_attribute(attr);
 
-    Some(response.encode())
+    response
 }
 
 /// Run the STUN server.
@@ -131,17 +135,23 @@ pub async fn run_server(
                         tokio::spawn(async move {
                             state.inc_requests();
                             debug!("Request from {} ({} bytes)", client_addr, len);
-                            debug!("Received: {:02x?}", data);
+                            trace!("Received: {:02x?}", data);
 
-                            match build_response(&data, client_addr) {
-                                Some(response) => {
-                                    debug!("Response: {:02x?}", response);
+                            match StunMessage::decode(&data) {
+                                Ok(request) if request.message_type == StunMessageType::Request => {
+                                    debug!("Received: {}", describe_message(&request));
+
+                                    let response_msg = build_response_message(&request, client_addr);
+                                    debug!("Response: {}", describe_message(&response_msg));
+
+                                    let response = response_msg.encode();
+                                    trace!("Response: {:02x?}", response);
                                     if let Err(e) = sock.send_to(&response, client_addr).await {
                                         state.inc_errors();
                                         warn!("Failed to send response to {}: {}", client_addr, e);
                                     }
                                 }
-                                None => {
+                                _ => {
                                     state.inc_errors();
                                     debug!("Invalid STUN request from {}", client_addr);
                                 }
@@ -178,7 +188,8 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stun_protocol::{StunMessage, StunMessageType};
+    use stun_protocol::message::MAGIC_COOKIE;
+    use stun_protocol::{describe_attribute, StunMessage, StunMessageType};
 
     #[test]
     fn test_server_state_new() {
@@ -321,6 +332,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mapped.port, 0);
+    }
+
+    fn txn_hex(transaction_id: &[u8; 12]) -> String {
+        transaction_id
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+
+    #[test]
+    fn test_describe_message_empty_attributes() {
+        let transaction_id = [0u8; 12];
+        let msg = StunMessage::new(StunMessageType::Request, transaction_id);
+        assert_eq!(
+            describe_message(&msg),
+            format!("Binding Request txn={} attrs=[]", txn_hex(&transaction_id))
+        );
+    }
+
+    #[test]
+    fn test_describe_message_with_software() {
+        let transaction_id = [
+            0x09, 0xe9, 0x6d, 0x1c, 0x0e, 0x8a, 0xe3, 0x18, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut msg = StunMessage::new(StunMessageType::Request, transaction_id);
+        msg.add_attribute(StunAttribute::new(
+            StunAttributeType::Software,
+            b"test-client".to_vec(),
+        ));
+
+        assert_eq!(
+            describe_message(&msg),
+            format!(
+                "Binding Request txn={} attrs=[SOFTWARE=\"test-client\"]",
+                txn_hex(&transaction_id)
+            )
+        );
+    }
+
+    #[test]
+    fn test_describe_message_xor_mapped_ipv4() {
+        let transaction_id = [0x11; 12];
+        let client_addr: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let mapped = MappedAddress::new(client_addr.ip(), client_addr.port());
+        let xor_value = mapped.encode_xor(MAGIC_COOKIE, &transaction_id);
+
+        let mut msg = StunMessage::new(StunMessageType::Response, transaction_id);
+        msg.add_attribute(StunAttribute::new(
+            StunAttributeType::XorMappedAddress,
+            xor_value,
+        ));
+
+        assert_eq!(
+            describe_message(&msg),
+            format!(
+                "Binding Success Response txn={} attrs=[XOR-MAPPED-ADDRESS=192.0.2.1:5000]",
+                txn_hex(&transaction_id)
+            )
+        );
+    }
+
+    #[test]
+    fn test_describe_message_xor_mapped_ipv6() {
+        let transaction_id = [0x22; 12];
+        let client_addr: SocketAddr = "[2001:db8::1]:9999".parse().unwrap();
+        let mapped = MappedAddress::new(client_addr.ip(), client_addr.port());
+        let xor_value = mapped.encode_xor(MAGIC_COOKIE, &transaction_id);
+
+        let mut msg = StunMessage::new(StunMessageType::Response, transaction_id);
+        msg.add_attribute(StunAttribute::new(
+            StunAttributeType::XorMappedAddress,
+            xor_value,
+        ));
+
+        assert_eq!(
+            describe_message(&msg),
+            format!(
+                "Binding Success Response txn={} attrs=[XOR-MAPPED-ADDRESS=[2001:db8::1]:9999]",
+                txn_hex(&transaction_id)
+            )
+        );
+    }
+
+    #[test]
+    fn test_describe_attribute_unknown_type_uses_raw_code() {
+        let raw = [0xAB, 0xCD, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+        let attr = StunAttribute::decode(&raw).unwrap();
+        let transaction_id = [0u8; 12];
+
+        assert_eq!(
+            describe_attribute(&attr, MAGIC_COOKIE, &transaction_id),
+            "0xABCD(len=4)"
+        );
+    }
+
+    #[test]
+    fn test_describe_attribute_address_decode_failure() {
+        // Address family 0x03 is invalid, so decoding must fail.
+        let attr = StunAttribute::new(
+            StunAttributeType::XorMappedAddress,
+            vec![0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        );
+        let transaction_id = [0u8; 12];
+
+        assert_eq!(
+            describe_attribute(&attr, MAGIC_COOKIE, &transaction_id),
+            "XOR-MAPPED-ADDRESS(len=8)"
+        );
+    }
+
+    #[test]
+    fn test_describe_attribute_known_non_address() {
+        let attr = StunAttribute::new(StunAttributeType::ErrorCode, vec![0x00, 0x00, 0x04, 0x00]);
+        let transaction_id = [0u8; 12];
+
+        assert_eq!(
+            describe_attribute(&attr, MAGIC_COOKIE, &transaction_id),
+            "ERROR-CODE(len=4)"
+        );
     }
 
     #[test]

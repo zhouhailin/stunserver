@@ -3,7 +3,9 @@
 //! Performance testing tool for STUN servers. Sends requests at a
 //! configurable QPS rate and reports latency percentiles and success rates.
 
+use chrono::Local;
 use clap::Parser;
+use std::io::Write;
 use std::process;
 use std::time::Duration;
 use stunbench::{
@@ -41,9 +43,13 @@ struct Args {
     #[arg(long)]
     quiet: bool,
 
-    /// Enable debug logging (prints network messages).
+    /// Enable debug logging (prints message summaries).
     #[arg(long)]
     debug: bool,
+
+    /// Enable trace logging (prints raw packet bytes; implies debug).
+    #[arg(long)]
+    trace: bool,
 
     /// Use only IPv4 addresses.
     #[arg(short = '4', long = "ipv4-only", conflicts_with = "ipv6_only")]
@@ -69,11 +75,11 @@ fn main() {
         metadata.log_startup();
     }
 
-    // Initialize console-only logging with debug level if requested.
-    if args.debug {
-        std::env::set_var("RUST_LOG", "debug");
+    // Initialize console-only logging with the requested level.
+    if let Some(level) = requested_log_level(&args) {
+        std::env::set_var("RUST_LOG", level);
     }
-    env_logger::init();
+    init_console_logging();
 
     // Determine address family filter.
     let family = if args.ipv4_only {
@@ -159,5 +165,85 @@ fn main() {
             eprintln!("Error: {}", e);
             process::exit(3);
         }
+    }
+}
+
+/// Initialize console logging with the same format as the server.
+fn init_console_logging() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{}] {}",
+                Local::now().format("%Y-%m-%dT%H:%M:%S%.3f"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+}
+
+/// Resolve the RUST_LOG level from CLI flags; trace wins over debug.
+fn requested_log_level(args: &Args) -> Option<&'static str> {
+    if args.trace {
+        Some("trace")
+    } else if args.debug {
+        Some("debug")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Args {
+        Args::try_parse_from(args).expect("args should parse")
+    }
+
+    #[test]
+    fn test_trace_flag_parsed() {
+        let args = parse(&["stunbench", "127.0.0.1", "--qps", "10", "--trace"]);
+        assert!(args.trace);
+    }
+
+    #[test]
+    fn test_level_trace_only() {
+        let args = parse(&["stunbench", "127.0.0.1", "--qps", "10", "--trace"]);
+        assert_eq!(requested_log_level(&args), Some("trace"));
+    }
+
+    #[test]
+    fn test_level_debug_only() {
+        let args = parse(&["stunbench", "127.0.0.1", "--qps", "10", "--debug"]);
+        assert_eq!(requested_log_level(&args), Some("debug"));
+    }
+
+    #[test]
+    fn test_level_trace_wins_over_debug() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--debug",
+            "--trace",
+        ]);
+        assert_eq!(requested_log_level(&args), Some("trace"));
+    }
+
+    #[test]
+    fn test_level_unset_without_flags() {
+        let args = parse(&["stunbench", "127.0.0.1", "--qps", "10"]);
+        assert_eq!(requested_log_level(&args), None);
+    }
+
+    #[test]
+    fn test_help_documents_trace() {
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("--trace"));
+        assert!(help.contains("prints raw packet bytes"));
     }
 }

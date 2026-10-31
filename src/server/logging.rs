@@ -10,6 +10,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// Format a timestamp with millisecond precision.
+fn format_timestamp(now: chrono::DateTime<Local>) -> String {
+    now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
+}
+
 /// A simple file logger with daily rotation and size-based rotation.
 struct FileLogger {
     /// Current log file handle.
@@ -59,19 +64,20 @@ impl FileLogger {
         let now = Local::now();
         let today = now.format("%Y-%m-%d").to_string();
 
-        // Daily rotation: if the date has changed, rotate the file.
+        // Daily rotation: archive under the date the content belongs to.
         if today != self.current_date {
-            self.rotate(&today)?;
+            let previous_date = self.current_date.clone();
+            self.rotate(&previous_date)?;
             self.current_date = today;
         }
 
         // Size-based rotation: if file exceeds max_size, rotate.
         if self.current_size >= self.max_size {
-            let date_suffix = Local::now().format("%Y-%m-%d").to_string();
-            self.rotate(&date_suffix)?;
+            let current_date = self.current_date.clone();
+            self.rotate(&current_date)?;
         }
 
-        let timestamp = now.format("%Y-%m-%dT%H:%M:%S%.3f");
+        let timestamp = format_timestamp(now);
         let line = format!("{} [{}] {}\n", timestamp, record.level(), record.args());
 
         let bytes = line.as_bytes();
@@ -81,8 +87,8 @@ impl FileLogger {
         Ok(())
     }
 
-    /// Rotate the current log file: rename to `{path}.{date}`, open a fresh file,
-    /// and prune old files exceeding `max_files`.
+    /// Rotate the current log file to `{path}.{date}.{sequence}`, open a fresh
+    /// file, and prune old files exceeding `max_files`.
     fn rotate(&mut self, date_suffix: &str) -> Result<(), std::io::Error> {
         // Close current file by dropping, then rename.
         drop(std::mem::replace(
@@ -90,16 +96,16 @@ impl FileLogger {
             File::create("/dev/null")?,
         ));
 
-        let rotated_path = PathBuf::from(format!("{}.{}", self.path.display(), date_suffix));
-
-        // If a rotated file with today's date already exists, append a sequence number.
-        let mut final_rotated = rotated_path.clone();
+        // Pick the first free sequence number for this date; never overwrite.
         let mut seq = 1u32;
-        while final_rotated.exists() {
-            final_rotated =
+        let final_rotated = loop {
+            let candidate =
                 PathBuf::from(format!("{}.{}.{}", self.path.display(), date_suffix, seq));
+            if !candidate.exists() {
+                break candidate;
+            }
             seq += 1;
-        }
+        };
 
         // Rename current log to rotated name (ignore error if source doesn't exist).
         let _ = fs::rename(&self.path, &final_rotated);
@@ -179,7 +185,8 @@ impl log::Log for StunLogger {
         }
 
         if self.enable_console {
-            eprintln!("[{}] {}", record.level(), record.args());
+            let timestamp = format_timestamp(Local::now());
+            eprintln!("{} [{}] {}", timestamp, record.level(), record.args());
         }
 
         if let Ok(mut guard) = FILE_LOGGER.lock() {
@@ -539,5 +546,169 @@ mod tests {
         }
 
         logger.flush();
+    }
+
+    fn today_string() -> String {
+        Local::now().format("%Y-%m-%d").to_string()
+    }
+
+    fn read_file(path: &std::path::Path) -> String {
+        let mut contents = String::new();
+        File::open(path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        contents
+    }
+
+    fn write_info(logger: &mut FileLogger, message: &str) {
+        logger
+            .write_log(
+                &log::Record::builder()
+                    .args(format_args!("{}", message))
+                    .level(log::Level::Info)
+                    .build(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_rotate_names_first_file_with_date_and_sequence_one() {
+        let dir = std::env::temp_dir().join("stunserver_test_rotate_naming_first");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let config = test_logging_config(&dir);
+        let mut logger = FileLogger::new(&config).unwrap();
+        logger.max_size = 10;
+
+        write_info(&mut logger, "first message");
+        // The next write sees the size limit exceeded and rotates first.
+        write_info(&mut logger, "second message");
+
+        let rotated = dir.join(format!("test.log.{}.1", today_string()));
+        assert!(rotated.exists(), "expected {}", rotated.display());
+        let contents = read_file(&rotated);
+        assert!(contents.contains("first message"));
+        assert!(!contents.contains("second message"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rotate_increments_sequence_without_overwriting() {
+        let dir = std::env::temp_dir().join("stunserver_test_rotate_naming_sequence");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let today = today_string();
+        let first_rotated = dir.join(format!("test.log.{}.1", today));
+        fs::write(&first_rotated, "sentinel").unwrap();
+
+        let config = test_logging_config(&dir);
+        let mut logger = FileLogger::new(&config).unwrap();
+        logger.max_size = 10;
+
+        write_info(&mut logger, "first message");
+        write_info(&mut logger, "second message");
+
+        let second_rotated = dir.join(format!("test.log.{}.2", today));
+        assert!(
+            second_rotated.exists(),
+            "expected {}",
+            second_rotated.display()
+        );
+        assert!(read_file(&second_rotated).contains("first message"));
+        assert_eq!(read_file(&first_rotated), "sentinel");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cross_day_rotation_uses_previous_date_then_starts_at_one() {
+        let dir = std::env::temp_dir().join("stunserver_test_rotate_cross_day");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let config = test_logging_config(&dir);
+        let mut logger = FileLogger::new(&config).unwrap();
+        logger.max_size = 1_000_000;
+        logger.current_date = "2020-01-01".to_string();
+
+        write_info(&mut logger, "first message");
+
+        let old_date_rotated = dir.join("test.log.2020-01-01.1");
+        assert!(
+            old_date_rotated.exists(),
+            "expected {}",
+            old_date_rotated.display()
+        );
+        assert_eq!(logger.current_date, today_string());
+
+        // The first size rotation of the new day must use sequence 1.
+        logger.max_size = 1;
+        write_info(&mut logger, "second message");
+
+        let today_rotated = dir.join(format!("test.log.{}.1", today_string()));
+        assert!(
+            today_rotated.exists(),
+            "expected {}",
+            today_rotated.display()
+        );
+        assert!(read_file(&today_rotated).contains("first message"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_still_covers_legacy_rotated_names() {
+        let dir = std::env::temp_dir().join("stunserver_test_rotate_legacy_prune");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let config = test_logging_config(&dir);
+        let log_path = config.log_file_path();
+        let today = today_string();
+
+        File::create(dir.join("test.log.2026-10-29")).unwrap();
+        File::create(dir.join(format!("test.log.{}.1", today))).unwrap();
+        File::create(dir.join(format!("test.log.{}.2", today))).unwrap();
+        File::create(dir.join(format!("test.log.{}.3", today))).unwrap();
+        File::create(&log_path).unwrap();
+
+        let logger = FileLogger::new(&config).unwrap();
+        logger.prune_old_files().unwrap();
+
+        let rotated_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("test.log.") && name != "test.log"
+            })
+            .count();
+
+        assert!(
+            rotated_count <= config.retention_days as usize,
+            "expected <= {} rotated files, got {}",
+            config.retention_days,
+            rotated_count
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_format_timestamp_has_millisecond_precision() {
+        let timestamp = format_timestamp(Local::now());
+
+        // e.g. 2026-10-31T14:39:08.123
+        assert_eq!(timestamp.len(), 23);
+        assert_eq!(&timestamp[19..20], ".");
+        assert!(timestamp[20..].chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(&timestamp[4..5], "-");
+        assert_eq!(&timestamp[10..11], "T");
+        assert_eq!(&timestamp[13..14], ":");
+        assert_eq!(&timestamp[16..17], ":");
     }
 }

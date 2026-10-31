@@ -118,8 +118,8 @@ After installation, the server uses the following directory structure:
 ├── etc/
 │   └── stunserver.conf         # Configuration file
 └── log/
-    ├── stunserver.log          # Current log file
-    └── stunserver.log.1        # Rotated log files
+    ├── stunserver.log                    # Current log file
+    └── stunserver.log.2026-10-31.1       # Rotated log file
 ```
 
 ## Management Commands
@@ -204,9 +204,11 @@ The server includes built-in log rotation with the following features:
 
 Log files are named:
 - `stunserver.log` - Current active log
-- `stunserver.log.1` - Most recent rotated log
-- `stunserver.log.2` - Older rotated log
+- `stunserver.log.YYYY-MM-DD.1` - First rotated log of that day
+- `stunserver.log.YYYY-MM-DD.2` - Second rotated log of that day
 - ...
+
+Sequence numbers start at 1 each day, are not zero-padded, and existing files are never overwritten.
 
 ## Troubleshooting
 

@@ -46,6 +46,8 @@ impl StunAttributeType {
 pub struct StunAttribute {
     /// Attribute type
     pub attribute_type: StunAttributeType,
+    /// Raw attribute type code as sent on the wire
+    pub raw_type: u16,
     /// Attribute length
     pub attribute_length: u16,
     /// Attribute value (raw bytes)
@@ -58,6 +60,7 @@ impl StunAttribute {
         let length = value.len() as u16;
         Self {
             attribute_type,
+            raw_type: attribute_type as u16,
             attribute_length: length,
             attribute_value: value,
         }
@@ -77,7 +80,7 @@ impl StunAttribute {
 
         // Attribute type (2 bytes)
         let mut type_bytes = [0u8; 2];
-        BigEndian::write_u16(&mut type_bytes, self.attribute_type as u16);
+        BigEndian::write_u16(&mut type_bytes, self.raw_type);
         buffer.extend_from_slice(&type_bytes);
 
         // Attribute length (2 bytes)
@@ -121,6 +124,7 @@ impl StunAttribute {
 
         Ok(Self {
             attribute_type,
+            raw_type: attr_type_raw,
             attribute_length,
             attribute_value,
         })

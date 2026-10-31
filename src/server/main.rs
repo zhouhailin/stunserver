@@ -32,9 +32,13 @@ struct Args {
     #[arg(short, long)]
     quiet: bool,
 
-    /// Enable debug logging (sets log level to debug and prints network messages).
+    /// Enable debug logging (prints parsed message summaries).
     #[arg(long)]
     debug: bool,
+
+    /// Enable trace logging (prints raw packet bytes; implies debug).
+    #[arg(long)]
+    trace: bool,
 }
 
 fn main() {
@@ -59,10 +63,8 @@ fn main() {
         cfg.server.port = listen.port();
     }
 
-    // Debug flag overrides log level.
-    if args.debug {
-        cfg.logging.level = "debug".to_string();
-    }
+    // CLI level flags override the configured log level.
+    cfg.logging.level = resolve_log_level(&args, &cfg.logging.level);
 
     // Validate final configuration.
     if let Err(e) = config::validate_config(&cfg) {
@@ -123,5 +125,58 @@ fn main() {
             }
             process::exit(3);
         }
+    }
+}
+
+/// Resolve the effective log level: CLI flags override the configured level.
+fn resolve_log_level(args: &Args, config_level: &str) -> String {
+    if args.trace {
+        "trace".to_string()
+    } else if args.debug {
+        "debug".to_string()
+    } else {
+        config_level.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Args {
+        Args::try_parse_from(args).expect("args should parse")
+    }
+
+    #[test]
+    fn test_level_override_debug_only() {
+        let args = parse(&["stunserver", "--debug"]);
+        assert_eq!(resolve_log_level(&args, "info"), "debug");
+    }
+
+    #[test]
+    fn test_level_override_trace_only() {
+        let args = parse(&["stunserver", "--trace"]);
+        assert_eq!(resolve_log_level(&args, "info"), "trace");
+    }
+
+    #[test]
+    fn test_level_override_trace_wins_over_debug() {
+        let args = parse(&["stunserver", "--trace", "--debug"]);
+        assert_eq!(resolve_log_level(&args, "warn"), "trace");
+    }
+
+    #[test]
+    fn test_level_override_keeps_config_without_flags() {
+        let args = parse(&["stunserver"]);
+        assert_eq!(resolve_log_level(&args, "warn"), "warn");
+    }
+
+    #[test]
+    fn test_help_documents_trace_and_debug() {
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("--debug"));
+        assert!(help.contains("--trace"));
+        assert!(help.contains("prints raw packet bytes"));
     }
 }
