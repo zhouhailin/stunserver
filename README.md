@@ -17,7 +17,7 @@ A high-performance STUN (Session Traversal Utilities for NAT) server implementat
 
 ### Prerequisites
 
-- Rust 1.75+ (for building from source)
+- Rust 1.83+ (for building from source)
 - Linux system with systemd (for deployment)
 - Docker 20.10+ (for container deployment)
 

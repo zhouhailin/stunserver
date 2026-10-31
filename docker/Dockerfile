@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for STUN Server
 # Stage 1: Builder - Compile Rust application
-FROM rust:1.75-alpine AS builder
+FROM rust:1.96-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache musl-dev
@@ -18,7 +18,7 @@ COPY build.rs ./
 RUN cargo build --release
 
 # Stage 2: Runtime - Minimal Alpine image
-FROM alpine:3.19
+FROM alpine:3
 
 # Install runtime dependencies
 RUN apk add --no-cache \
