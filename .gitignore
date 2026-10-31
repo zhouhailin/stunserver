@@ -43,3 +43,16 @@ dist/
 # Test artifacts
 test-logs/
 test-config/
+
+# Rust build artifacts and editor temporaries
+*.rlib
+*.prof*
+.vscode/
+*.swp
+*.tmp
+
+# Generated stress-test reports. FR-004 puts them in docs/ by default, but they
+# are per-run output, not source: committing them makes every test run dirty the
+# tree and makes cross-configuration diffs (guide §5) unreadable.
+docs/stress-test-report-*.md
+stress-test-results/
