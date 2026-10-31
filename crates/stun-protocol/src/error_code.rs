@@ -92,7 +92,12 @@ impl UnknownAttributes {
                 "UNKNOWN-ATTRIBUTES value length must be even".to_string(),
             ));
         }
-        let types = data.chunks_exact(2).map(BigEndian::read_u16).collect();
+        let types = data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| BigEndian::read_u16(chunk))
+            .collect();
         Ok(Self { types })
     }
 }
