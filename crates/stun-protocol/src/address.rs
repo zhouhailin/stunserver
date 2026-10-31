@@ -191,10 +191,11 @@ impl MappedAddress {
 
         let address = match family {
             AddressFamily::IPv4 => {
-                if data.len() < 8 {
-                    return Err(StunError::MalformedMessage(
-                        "IPv4 address truncated".to_string(),
-                    ));
+                if data.len() != 8 {
+                    return Err(StunError::MalformedMessage(format!(
+                        "IPv4 XOR-MAPPED-ADDRESS must be 8 bytes, got {}",
+                        data.len()
+                    )));
                 }
                 let mut xor_bytes = [0u8; 4];
                 xor_bytes.copy_from_slice(&data[4..8]);
@@ -202,10 +203,11 @@ impl MappedAddress {
                 IpAddr::V4(Ipv4Addr::from(ip_int))
             }
             AddressFamily::IPv6 => {
-                if data.len() < 20 {
-                    return Err(StunError::MalformedMessage(
-                        "IPv6 address truncated".to_string(),
-                    ));
+                if data.len() != 20 {
+                    return Err(StunError::MalformedMessage(format!(
+                        "IPv6 XOR-MAPPED-ADDRESS must be 20 bytes, got {}",
+                        data.len()
+                    )));
                 }
                 let mut xor_bytes = [0u8; 16];
                 xor_bytes.copy_from_slice(&data[4..20]);

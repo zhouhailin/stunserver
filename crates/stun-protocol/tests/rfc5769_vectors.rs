@@ -49,130 +49,168 @@ fn test_rfc5389_message_format() {
     assert_eq!(&encoded[8..20], &transaction_id);
 }
 
-/// Test XOR-MAPPED-ADDRESS encoding/decoding for IPv4
-///
-/// Verifies correct XOR encoding as specified in RFC 5389 Section 15.2
+/// RFC 5769 section 2.1 sample Binding Request (108 bytes).
+const SAMPLE_REQUEST: [u8; 108] = [
+    0x00, 0x01, 0x00, 0x58, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86,
+    0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x10, 0x53, 0x54, 0x55, 0x4e, 0x20, 0x74, 0x65, 0x73,
+    0x74, 0x20, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x00, 0x24, 0x00, 0x04, 0x6e, 0x00, 0x01, 0xff,
+    0x80, 0x29, 0x00, 0x08, 0x93, 0x2f, 0xf9, 0xb1, 0x51, 0x26, 0x3b, 0x36, 0x00, 0x06, 0x00, 0x09,
+    0x65, 0x76, 0x74, 0x6a, 0x3a, 0x68, 0x36, 0x76, 0x59, 0x20, 0x20, 0x20, 0x00, 0x08, 0x00, 0x14,
+    0x9a, 0xea, 0xa7, 0x0c, 0xbf, 0xd8, 0xcb, 0x56, 0x78, 0x1e, 0xf2, 0xb5, 0xb2, 0xd3, 0xf2, 0x49,
+    0xc1, 0xb5, 0x71, 0xa2, 0x80, 0x28, 0x00, 0x04, 0xe5, 0x7a, 0x3b, 0xcf,
+];
+
+/// RFC 5769 section 2.2 sample IPv4 Binding Success Response (80 bytes).
+const SAMPLE_IPV4_RESPONSE: [u8; 80] = [
+    0x01, 0x01, 0x00, 0x3c, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86,
+    0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x0b, 0x74, 0x65, 0x73, 0x74, 0x20, 0x76, 0x65, 0x63,
+    0x74, 0x6f, 0x72, 0x20, 0x00, 0x20, 0x00, 0x08, 0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43,
+    0x00, 0x08, 0x00, 0x14, 0x2b, 0x91, 0xf5, 0x99, 0xfd, 0x9e, 0x90, 0xc3, 0x8c, 0x74, 0x89, 0xf9,
+    0x2a, 0xf9, 0xba, 0x53, 0xf0, 0x6b, 0xe7, 0xd7, 0x80, 0x28, 0x00, 0x04, 0xc0, 0x7d, 0x4c, 0x96,
+];
+
+/// RFC 5769 section 2.3 sample IPv6 Binding Success Response (92 bytes).
+const SAMPLE_IPV6_RESPONSE: [u8; 92] = [
+    0x01, 0x01, 0x00, 0x48, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86,
+    0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x0b, 0x74, 0x65, 0x73, 0x74, 0x20, 0x76, 0x65, 0x63,
+    0x74, 0x6f, 0x72, 0x20, 0x00, 0x20, 0x00, 0x14, 0x00, 0x02, 0xa1, 0x47, 0x01, 0x13, 0xa9, 0xfa,
+    0xa5, 0xd3, 0xf1, 0x79, 0xbc, 0x25, 0xf4, 0xb5, 0xbe, 0xd2, 0xb9, 0xd9, 0x00, 0x08, 0x00, 0x14,
+    0xa3, 0x82, 0x95, 0x4e, 0x4b, 0xe6, 0x7b, 0xf1, 0x17, 0x84, 0xc9, 0x7c, 0x82, 0x92, 0xc2, 0x75,
+    0xbf, 0xe3, 0xed, 0x41, 0x80, 0x28, 0x00, 0x04, 0xc8, 0xfb, 0x0b, 0x4c,
+];
+
+/// RFC 5769 section 2.4 sample request with long-term authentication (116 bytes).
+const SAMPLE_LONG_TERM_REQUEST: [u8; 116] = [
+    0x00, 0x01, 0x00, 0x60, 0x21, 0x12, 0xa4, 0x42, 0x78, 0xad, 0x34, 0x33, 0xc6, 0xad, 0x72, 0xc0,
+    0x29, 0xda, 0x41, 0x2e, 0x00, 0x06, 0x00, 0x12, 0xe3, 0x83, 0x9e, 0xe3, 0x83, 0x88, 0xe3, 0x83,
+    0xaa, 0xe3, 0x83, 0x83, 0xe3, 0x82, 0xaf, 0xe3, 0x82, 0xb9, 0x00, 0x00, 0x00, 0x15, 0x00, 0x1c,
+    0x66, 0x2f, 0x2f, 0x34, 0x39, 0x39, 0x6b, 0x39, 0x35, 0x34, 0x64, 0x36, 0x4f, 0x4c, 0x33, 0x34,
+    0x6f, 0x4c, 0x39, 0x46, 0x53, 0x54, 0x76, 0x79, 0x36, 0x34, 0x73, 0x41, 0x00, 0x14, 0x00, 0x0b,
+    0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x6f, 0x72, 0x67, 0x00, 0x00, 0x08, 0x00, 0x14,
+    0xf6, 0x70, 0x24, 0x65, 0x6d, 0xd6, 0x4a, 0x3e, 0x02, 0xb8, 0xe0, 0x71, 0x2e, 0x85, 0xc9, 0xa2,
+    0x8c, 0xa8, 0x96, 0x66,
+];
+
+/// RFC 5769 section 2.1: exact request bytes decode to documented values and
+/// re-encode byte-for-byte, including the space (0x20) USERNAME padding.
 #[test]
-fn test_rfc5769_xor_mapped_address_ipv4() {
-    use std::net::{IpAddr, Ipv4Addr};
+fn test_rfc5769_sample_request() {
+    let message = StunMessage::decode(&SAMPLE_REQUEST).expect("decode sample request");
 
-    // Test address from RFC 5769 examples
-    let original_address = MappedAddress::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+    assert_eq!(message.message_type, StunMessageType::Request);
+    assert_eq!(message.message_length, 0x58);
+    assert_eq!(message.magic_cookie, 0x2112A442);
+    assert_eq!(
+        message.transaction_id,
+        [0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae]
+    );
+    assert_eq!(message.attributes.len(), 6);
 
-    // Use standard magic cookie and transaction ID
-    let magic_cookie = 0x2112A442;
-    let transaction_id = [
-        0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
-    ];
+    assert_eq!(message.attributes[0].raw_type, 0x8022);
+    assert_eq!(message.attributes[0].attribute_value, b"STUN test client");
+    assert_eq!(message.attributes[1].raw_type, 0x0024);
+    assert_eq!(
+        message.attributes[1].attribute_value,
+        [0x6e, 0x00, 0x01, 0xff]
+    );
+    assert_eq!(message.attributes[2].raw_type, 0x8029);
+    assert_eq!(message.attributes[2].attribute_value.len(), 8);
+    assert_eq!(message.attributes[3].raw_type, 0x0006);
+    assert_eq!(message.attributes[3].attribute_value, b"evtj:h6vY");
+    assert_eq!(message.attributes[3].padding, [0x20, 0x20, 0x20]);
+    assert_eq!(message.attributes[4].raw_type, 0x0008);
+    assert_eq!(message.attributes[4].attribute_value.len(), 20);
+    assert_eq!(message.attributes[5].raw_type, 0x8028);
+    assert_eq!(message.attributes[5].attribute_value.len(), 4);
 
-    // Encode XOR-MAPPED-ADDRESS
-    let encoded = original_address.encode_xor(magic_cookie, &transaction_id);
-
-    // Verify encoding produces correct length
-    assert_eq!(encoded.len(), 8, "IPv4 XOR-MAPPED-ADDRESS must be 8 bytes");
-
-    // Decode XOR-MAPPED-ADDRESS
-    let decoded = MappedAddress::decode_xor(&encoded, magic_cookie, &transaction_id)
-        .expect("Failed to decode XOR-MAPPED-ADDRESS");
-
-    // Verify round-trip
-    assert_eq!(decoded.address, original_address.address);
-    assert_eq!(decoded.port, original_address.port);
-    assert_eq!(decoded.family, AddressFamily::IPv4);
+    assert_eq!(message.encode(), SAMPLE_REQUEST);
 }
 
-/// Test XOR-MAPPED-ADDRESS encoding/decoding for IPv6
-///
-/// Verifies correct XOR encoding for IPv6 addresses
+/// RFC 5769 section 2.2: IPv4 response decodes to 192.0.2.1:32853.
 #[test]
-fn test_rfc5769_xor_mapped_address_ipv6() {
-    use std::net::{IpAddr, Ipv6Addr};
+fn test_rfc5769_sample_ipv4_response() {
+    let message = StunMessage::decode(&SAMPLE_IPV4_RESPONSE).expect("decode IPv4 response");
 
-    // Test IPv6 address
-    let original_address = MappedAddress::new(
-        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-        3478,
-    );
+    assert_eq!(message.message_type, StunMessageType::Response);
+    assert_eq!(message.message_length, 0x3c);
+    assert_eq!(message.attributes.len(), 4);
+    assert_eq!(message.attributes[0].raw_type, 0x8022);
+    assert_eq!(message.attributes[0].attribute_value, b"test vector");
+    assert_eq!(message.attributes[1].raw_type, 0x0020);
 
-    let magic_cookie = 0x2112A442;
-    let transaction_id = [
-        0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
-    ];
-
-    // Encode XOR-MAPPED-ADDRESS
-    let encoded = original_address.encode_xor(magic_cookie, &transaction_id);
-
-    // Verify encoding produces correct length
+    let mapped = MappedAddress::decode_xor(
+        &message.attributes[1].attribute_value,
+        message.magic_cookie,
+        &message.transaction_id,
+    )
+    .expect("decode XOR-MAPPED-ADDRESS");
+    assert_eq!(mapped.port, 32853);
     assert_eq!(
-        encoded.len(),
-        20,
-        "IPv6 XOR-MAPPED-ADDRESS must be 20 bytes"
+        mapped.address,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))
     );
 
-    // Decode XOR-MAPPED-ADDRESS
-    let decoded = MappedAddress::decode_xor(&encoded, magic_cookie, &transaction_id)
-        .expect("Failed to decode XOR-MAPPED-ADDRESS");
-
-    // Verify round-trip
-    assert_eq!(decoded.address, original_address.address);
-    assert_eq!(decoded.port, original_address.port);
-    assert_eq!(decoded.family, AddressFamily::IPv6);
+    assert_eq!(message.encode(), SAMPLE_IPV4_RESPONSE);
 }
 
-/// Test STUN message with multiple attributes
-///
-/// Verifies correct encoding/decoding of messages with attributes
+/// RFC 5769 section 2.3: IPv6 response decodes to the documented address.
 #[test]
-fn test_rfc5769_message_with_attributes() {
-    let transaction_id = [
-        0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
-    ];
+fn test_rfc5769_sample_ipv6_response() {
+    let message = StunMessage::decode(&SAMPLE_IPV6_RESPONSE).expect("decode IPv6 response");
 
-    // Create a response message
-    let mut message = StunMessage::new(StunMessageType::Response, transaction_id);
+    assert_eq!(message.message_type, StunMessageType::Response);
+    assert_eq!(message.message_length, 0x48);
+    assert_eq!(message.attributes.len(), 4);
+    assert_eq!(message.attributes[1].raw_type, 0x0020);
 
-    // Add SOFTWARE attribute
-    let software = b"RFC 5769 Test".to_vec();
-    let attr1 = StunAttribute::new(StunAttributeType::Software, software.clone());
-    message.add_attribute(attr1);
-
-    // Add XOR-MAPPED-ADDRESS attribute
-    use std::net::{IpAddr, Ipv4Addr};
-    let mapped_addr = MappedAddress::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
-    let xor_encoded = mapped_addr.encode_xor(message.magic_cookie, &transaction_id);
-    let attr2 = StunAttribute::new(StunAttributeType::XorMappedAddress, xor_encoded);
-    message.add_attribute(attr2);
-
-    // Encode
-    let encoded = message.encode();
-
-    // Verify message length is correct
-    assert!(
-        encoded.len() > 20,
-        "Message with attributes must be > 20 bytes"
-    );
-
-    // Decode
-    let decoded = StunMessage::decode(&encoded).expect("Failed to decode message");
-
-    // Verify
-    assert_eq!(decoded.message_type, StunMessageType::Response);
-    assert_eq!(decoded.magic_cookie, 0x2112A442);
-    assert_eq!(decoded.transaction_id, transaction_id);
-    assert_eq!(decoded.attributes.len(), 2);
-
-    // Verify first attribute
+    let mapped = MappedAddress::decode_xor(
+        &message.attributes[1].attribute_value,
+        message.magic_cookie,
+        &message.transaction_id,
+    )
+    .expect("decode XOR-MAPPED-ADDRESS");
+    assert_eq!(mapped.port, 32853);
     assert_eq!(
-        decoded.attributes[0].attribute_type,
-        StunAttributeType::Software
+        mapped.address,
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0x0db8, 0x1234, 0x5678, 0x0011, 0x2233, 0x4455, 0x6677
+        ))
     );
-    assert_eq!(decoded.attributes[0].attribute_value, software);
 
-    // Verify second attribute
+    assert_eq!(message.encode(), SAMPLE_IPV6_RESPONSE);
+}
+
+/// RFC 5769 section 2.4: long-term credential request decodes and re-encodes
+/// byte-for-byte, preserving USERNAME and REALM zero padding.
+#[test]
+fn test_rfc5769_sample_long_term_request() {
+    let message = StunMessage::decode(&SAMPLE_LONG_TERM_REQUEST).expect("decode long-term request");
+
+    assert_eq!(message.message_type, StunMessageType::Request);
+    assert_eq!(message.message_length, 0x60);
+    assert_eq!(message.attributes.len(), 4);
+
+    assert_eq!(message.attributes[0].raw_type, 0x0006);
     assert_eq!(
-        decoded.attributes[1].attribute_type,
-        StunAttributeType::XorMappedAddress
+        String::from_utf8(message.attributes[0].attribute_value.clone()).unwrap(),
+        "\u{30de}\u{30c8}\u{30ea}\u{30c3}\u{30af}\u{30b9}"
     );
+    assert_eq!(message.attributes[0].padding, [0x00, 0x00]);
+
+    assert_eq!(message.attributes[1].raw_type, 0x0015);
+    assert_eq!(
+        message.attributes[1].attribute_value,
+        b"f//499k954d6OL34oL9FSTvy64sA"
+    );
+
+    assert_eq!(message.attributes[2].raw_type, 0x0014);
+    assert_eq!(message.attributes[2].attribute_value, b"example.org");
+    assert_eq!(message.attributes[2].padding, [0x00]);
+
+    assert_eq!(message.attributes[3].raw_type, 0x0008);
+    assert_eq!(message.attributes[3].attribute_value.len(), 20);
+
+    assert_eq!(message.encode(), SAMPLE_LONG_TERM_REQUEST);
 }
 
 /// Test magic cookie validation
@@ -248,39 +286,71 @@ fn test_rfc5769_attribute_padding() {
     }
 }
 
-/// Test STUN message round-trip encoding/decoding
+/// Test that non-zero attribute padding survives a decode/encode round trip.
 ///
-/// Verifies that messages can be encoded and decoded without loss
+/// RFC 5769 section 2.1 pads the 9-byte USERNAME with three space characters.
+/// The padding value is not significant on the wire, but a byte-identical
+/// re-encode must preserve it (RFC 5389 section 15: padding "MAY be any value").
 #[test]
-fn test_rfc5769_message_roundtrip() {
-    let transaction_id = [
+fn test_username_space_padding_preserved() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
+    bytes.extend_from_slice(&0x0010u16.to_be_bytes()); // 16 attribute bytes
+    bytes.extend_from_slice(&0x2112A442u32.to_be_bytes());
+    bytes.extend_from_slice(&[
         0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
-    ];
+    ]);
+    bytes.extend_from_slice(&0x0006u16.to_be_bytes()); // USERNAME
+    bytes.extend_from_slice(&0x0009u16.to_be_bytes()); // 9-byte value
+    bytes.extend_from_slice(b"test-user");
+    bytes.extend_from_slice(&[0x20, 0x20, 0x20]); // space padding
 
-    // Create a request message
-    let mut message = StunMessage::new(StunMessageType::Request, transaction_id);
+    let message = StunMessage::decode(&bytes).expect("decode message");
+    assert_eq!(message.attributes.len(), 1);
+    assert_eq!(message.attributes[0].attribute_value, b"test-user");
 
-    // Add SOFTWARE attribute
-    let software = b"test vector".to_vec();
-    let attr = StunAttribute::new(StunAttributeType::Software, software.clone());
-    message.add_attribute(attr);
+    let reencoded = message.encode();
+    assert_eq!(reencoded, bytes, "re-encode must preserve wire padding");
+    assert_eq!(&reencoded[33..36], &[0x20, 0x20, 0x20]);
+}
 
-    // Encode
-    let encoded = message.encode();
+/// Newly constructed attributes still emit zero padding.
+#[test]
+fn test_new_attribute_emits_zero_padding() {
+    let attr = StunAttribute::new(StunAttributeType::Software, vec![b'a'; 9]);
+    let encoded = attr.encode();
 
-    // Decode
-    let decoded = StunMessage::decode(&encoded).expect("Failed to decode message");
+    assert_eq!(encoded.len(), 16);
+    assert_eq!(&encoded[13..16], &[0x00, 0x00, 0x00]);
+}
 
-    // Verify
-    assert_eq!(decoded.message_type, message.message_type);
-    assert_eq!(decoded.magic_cookie, message.magic_cookie);
-    assert_eq!(decoded.transaction_id, message.transaction_id);
-    assert_eq!(decoded.attributes.len(), 1);
-    assert_eq!(
-        decoded.attributes[0].attribute_type,
-        StunAttributeType::Software
-    );
-    assert_eq!(decoded.attributes[0].attribute_value, software);
+/// An attribute whose value runs to the end with padding missing is rejected.
+#[test]
+fn test_attribute_truncated_padding_rejected() {
+    let mut raw = vec![0x00, 0x06, 0x00, 0x09];
+    raw.extend_from_slice(b"test-user");
+
+    let result = StunAttribute::decode(&raw);
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        StunError::MalformedMessage(_)
+    ));
+}
+
+/// A message claiming padded length but ending before the padding is rejected.
+#[test]
+fn test_message_truncated_padding_rejected() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0x0001u16.to_be_bytes());
+    bytes.extend_from_slice(&0x0010u16.to_be_bytes()); // claims 16 attribute bytes
+    bytes.extend_from_slice(&0x2112A442u32.to_be_bytes());
+    bytes.extend_from_slice(&[0u8; 12]);
+    bytes.extend_from_slice(&0x0006u16.to_be_bytes());
+    bytes.extend_from_slice(&0x0009u16.to_be_bytes());
+    bytes.extend_from_slice(b"test-user"); // 9 value bytes, no padding
+
+    assert!(StunMessage::decode(&bytes).is_err());
 }
 
 /// Test address family encoding

@@ -11,7 +11,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stun_protocol::{
-    describe_message, MappedAddress, StunAttribute, StunAttributeType, StunMessage, StunMessageType,
+    describe_message, is_comprehension_required, ErrorCode, MappedAddress, StunAttribute,
+    StunAttributeType, StunMessage, StunMessageType, UnknownAttributes,
 };
 use tokio::net::UdpSocket;
 use tokio::signal;
@@ -77,11 +78,59 @@ pub fn build_response(buf: &[u8], client_addr: SocketAddr) -> Option<Vec<u8>> {
         return None;
     }
 
-    Some(build_response_message(&request, client_addr).encode())
+    Some(response_for_request(&request, client_addr).encode())
+}
+
+/// Build the response for a decoded Binding Request.
+///
+/// Returns a Binding Success Response when every comprehension-required
+/// attribute is supported, or a 420 Binding Error Response listing the
+/// unsupported attribute types otherwise (RFC 5389 section 7.3.1).
+pub(crate) fn response_for_request(request: &StunMessage, client_addr: SocketAddr) -> StunMessage {
+    let unknown = unsupported_required_attributes(request);
+
+    if unknown.is_empty() {
+        build_success_response(request, client_addr)
+    } else {
+        build_unknown_attribute_response(request, unknown)
+    }
+}
+
+/// Collect comprehension-required attribute types no handler supports,
+/// preserving first-seen order and de-duplicating.
+fn unsupported_required_attributes(request: &StunMessage) -> Vec<u16> {
+    let mut types: Vec<u16> = Vec::new();
+
+    for attr in &request.attributes {
+        if is_comprehension_required(attr.raw_type) && !types.contains(&attr.raw_type) {
+            types.push(attr.raw_type);
+        }
+    }
+
+    types
+}
+
+/// Build a 420 Unknown Attribute error response.
+fn build_unknown_attribute_response(request: &StunMessage, unknown: Vec<u16>) -> StunMessage {
+    let mut response = StunMessage::new(StunMessageType::ErrorIndication, request.transaction_id);
+
+    let code = ErrorCode::new(4, 20, "Unknown Attribute".to_string());
+    response.add_attribute(StunAttribute::new(
+        StunAttributeType::ErrorCode,
+        code.encode_value(),
+    ));
+
+    let list = UnknownAttributes::new(unknown);
+    response.add_attribute(StunAttribute::new(
+        StunAttributeType::UnknownAttributes,
+        list.encode_value(),
+    ));
+
+    response
 }
 
 /// Build the Binding Success Response for a decoded request.
-fn build_response_message(request: &StunMessage, client_addr: SocketAddr) -> StunMessage {
+fn build_success_response(request: &StunMessage, client_addr: SocketAddr) -> StunMessage {
     let mut response = StunMessage::new(StunMessageType::Response, request.transaction_id);
 
     // Create XOR-MAPPED-ADDRESS attribute with client's reflexive address.
@@ -141,7 +190,7 @@ pub async fn run_server(
                                 Ok(request) if request.message_type == StunMessageType::Request => {
                                     debug!("Received: {}", describe_message(&request));
 
-                                    let response_msg = build_response_message(&request, client_addr);
+                                    let response_msg = response_for_request(&request, client_addr);
                                     debug!("Response: {}", describe_message(&response_msg));
 
                                     let response = response_msg.encode();
@@ -449,7 +498,7 @@ mod tests {
 
         assert_eq!(
             describe_attribute(&attr, MAGIC_COOKIE, &transaction_id),
-            "ERROR-CODE(len=4)"
+            "ERROR-CODE=400 \"\""
         );
     }
 
@@ -476,5 +525,114 @@ mod tests {
 
         assert_eq!(state.request_count.load(Ordering::Relaxed), 1000);
         assert_eq!(state.error_count.load(Ordering::Relaxed), 1000);
+    }
+
+    fn raw_attribute(raw_type: u16, value: &[u8]) -> StunAttribute {
+        let mut bytes = Vec::with_capacity(4 + value.len());
+        bytes.extend_from_slice(&raw_type.to_be_bytes());
+        bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(value);
+        StunAttribute::decode(&bytes).unwrap()
+    }
+
+    #[test]
+    fn test_build_response_unknown_required_attribute() {
+        use stun_protocol::{ErrorCode, StunAttributeType, UnknownAttributes};
+
+        let transaction_id = [0x31; 12];
+        let mut request = StunMessage::new(StunMessageType::Request, transaction_id);
+        request.add_attribute(raw_attribute(0x0024, &[0x6e, 0x00, 0x01, 0xff]));
+        let request_bytes = request.encode();
+
+        let client_addr: SocketAddr = "192.0.2.10:4000".parse().unwrap();
+        let response_bytes = build_response(&request_bytes, client_addr).unwrap();
+        let response = StunMessage::decode(&response_bytes).unwrap();
+
+        assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+        assert_eq!(response.transaction_id, transaction_id);
+        assert_eq!(response.magic_cookie, request.magic_cookie);
+        assert_eq!(response.attributes.len(), 2);
+        assert_eq!(
+            response.attributes[0].attribute_type,
+            StunAttributeType::ErrorCode
+        );
+        assert_eq!(
+            response.attributes[1].attribute_type,
+            StunAttributeType::UnknownAttributes
+        );
+        assert_eq!(response.attributes[1].raw_type, 0x000A);
+        assert!(response
+            .attributes
+            .iter()
+            .all(|attr| attr.attribute_type != StunAttributeType::XorMappedAddress));
+
+        let code = ErrorCode::decode_value(&response.attributes[0].attribute_value).unwrap();
+        assert_eq!(code.class, 4);
+        assert_eq!(code.number, 20);
+        assert_eq!(code.reason, "Unknown Attribute");
+
+        let unknown =
+            UnknownAttributes::decode_value(&response.attributes[1].attribute_value).unwrap();
+        assert_eq!(unknown.types, vec![0x0024]);
+    }
+
+    #[test]
+    fn test_build_response_unknown_required_deduplicates() {
+        use stun_protocol::UnknownAttributes;
+
+        let transaction_id = [0x32; 12];
+        let mut request = StunMessage::new(StunMessageType::Request, transaction_id);
+        request.add_attribute(raw_attribute(0x0024, &[0, 0, 0, 0]));
+        request.add_attribute(raw_attribute(0x0025, &[0, 0, 0, 0]));
+        request.add_attribute(raw_attribute(0x0024, &[0, 0, 0, 0]));
+        let request_bytes = request.encode();
+
+        let client_addr: SocketAddr = "192.0.2.11:4000".parse().unwrap();
+        let response_bytes = build_response(&request_bytes, client_addr).unwrap();
+        let response = StunMessage::decode(&response_bytes).unwrap();
+
+        assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+        let unknown =
+            UnknownAttributes::decode_value(&response.attributes[1].attribute_value).unwrap();
+        assert_eq!(unknown.types, vec![0x0024, 0x0025]);
+    }
+
+    #[test]
+    fn test_build_response_ignores_unknown_optional_attribute() {
+        let transaction_id = [0x33; 12];
+        let mut request = StunMessage::new(StunMessageType::Request, transaction_id);
+        request.add_attribute(raw_attribute(0x80FF, &[0xde, 0xad, 0xbe, 0xef]));
+        let request_bytes = request.encode();
+
+        let client_addr: SocketAddr = "192.0.2.12:4000".parse().unwrap();
+        let response_bytes = build_response(&request_bytes, client_addr).unwrap();
+        let response = StunMessage::decode(&response_bytes).unwrap();
+
+        assert_eq!(response.message_type, StunMessageType::Response);
+        assert_eq!(response.attributes.len(), 1);
+        assert_eq!(
+            response.attributes[0].attribute_type,
+            StunAttributeType::XorMappedAddress
+        );
+    }
+
+    #[test]
+    fn test_build_response_lists_only_required_attributes() {
+        use stun_protocol::UnknownAttributes;
+
+        let transaction_id = [0x34; 12];
+        let mut request = StunMessage::new(StunMessageType::Request, transaction_id);
+        request.add_attribute(raw_attribute(0x80FF, &[0x00, 0x00, 0x00, 0x00]));
+        request.add_attribute(raw_attribute(0x0024, &[0x00, 0x00, 0x00, 0x00]));
+        let request_bytes = request.encode();
+
+        let client_addr: SocketAddr = "192.0.2.13:4000".parse().unwrap();
+        let response_bytes = build_response(&request_bytes, client_addr).unwrap();
+        let response = StunMessage::decode(&response_bytes).unwrap();
+
+        assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+        let unknown =
+            UnknownAttributes::decode_value(&response.attributes[1].attribute_value).unwrap();
+        assert_eq!(unknown.types, vec![0x0024]);
     }
 }

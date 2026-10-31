@@ -143,6 +143,7 @@ fn main() {
                 client::ClientError::Timeout(_) => process::exit(3),
                 client::ClientError::Connection(_) => process::exit(2),
                 client::ClientError::Protocol(_) => process::exit(4),
+                client::ClientError::ServerError { .. } => process::exit(5),
                 client::ClientError::InvalidAddress(_) => process::exit(1),
             }
         }

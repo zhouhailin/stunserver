@@ -6,7 +6,8 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use stun_protocol::{
-    describe_message, MappedAddress, StunAttributeType, StunMessage, StunMessageType,
+    describe_message, is_comprehension_required, ErrorCode, MappedAddress, StunAttributeType,
+    StunMessage, StunMessageType, UnknownAttributes,
 };
 use tokio::net::UdpSocket;
 
@@ -33,6 +34,28 @@ pub enum ClientError {
 
     #[error("Invalid server address: {0}")]
     InvalidAddress(String),
+
+    #[error("{}", format_server_error(class, number, reason, unknown_attributes))]
+    ServerError {
+        class: u8,
+        number: u8,
+        reason: String,
+        unknown_attributes: Vec<u16>,
+    },
+}
+
+fn format_server_error(class: &u8, number: &u8, reason: &str, unknown: &[u16]) -> String {
+    let status = u16::from(*class) * 100 + u16::from(*number);
+    let list = if unknown.is_empty() {
+        "none".to_string()
+    } else {
+        unknown
+            .iter()
+            .map(|t| format!("0x{:04X}", t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("server returned error {status} ({reason}); unknown attributes: {list}")
 }
 
 /// Send a STUN Binding Request to the specified server address.
@@ -141,17 +164,33 @@ fn parse_response(
 
     log::debug!("Received: {}", describe_message(&response));
 
-    // Verify message type is a success response.
-    if response.message_type != StunMessageType::Response {
-        return Err(ClientError::Protocol(format!(
-            "unexpected message type: {:?}",
-            response.message_type
-        )));
-    }
-
-    // Verify transaction ID matches.
+    // Verify transaction ID matches before interpreting the message.
     if response.transaction_id != *expected_transaction_id {
         return Err(ClientError::Protocol("transaction ID mismatch".to_string()));
+    }
+
+    match response.message_type {
+        StunMessageType::ErrorIndication => return Err(parse_server_error(&response)),
+        StunMessageType::Response => {}
+        StunMessageType::Request => {
+            return Err(ClientError::Protocol(format!(
+                "unexpected message type: {:?}",
+                response.message_type
+            )));
+        }
+    }
+
+    // A success response carrying a comprehension-required attribute the
+    // client does not recognize cannot be trusted (RFC 5389 section 7.3.1).
+    if let Some(attr) = response
+        .attributes
+        .iter()
+        .find(|a| is_comprehension_required(a.raw_type) && !client_recognizes(a.raw_type))
+    {
+        return Err(ClientError::Protocol(format!(
+            "success response contains unknown required attribute 0x{:04X}",
+            attr.raw_type
+        )));
     }
 
     // Find XOR-MAPPED-ADDRESS attribute.
@@ -175,6 +214,39 @@ fn parse_response(
         mapped_address,
         latency,
     })
+}
+
+/// Comprehension-required attributes this client understands in a response.
+fn client_recognizes(raw_type: u16) -> bool {
+    matches!(raw_type, 0x0001 | 0x0009 | 0x000A | 0x0020)
+}
+
+/// Convert a decoded 0x0111 response into a structured client error.
+fn parse_server_error(response: &StunMessage) -> ClientError {
+    let code = response
+        .attributes
+        .iter()
+        .find(|a| a.attribute_type == StunAttributeType::ErrorCode)
+        .and_then(|a| ErrorCode::decode_value(&a.attribute_value).ok());
+
+    let Some(code) = code else {
+        return ClientError::Protocol("error response missing valid ERROR-CODE".to_string());
+    };
+
+    let unknown_attributes = response
+        .attributes
+        .iter()
+        .find(|a| a.attribute_type == StunAttributeType::UnknownAttributes)
+        .and_then(|a| UnknownAttributes::decode_value(&a.attribute_value).ok())
+        .map(|list| list.types)
+        .unwrap_or_default();
+
+    ClientError::ServerError {
+        class: code.class,
+        number: code.number,
+        reason: code.reason,
+        unknown_attributes,
+    }
 }
 
 /// Generate a random 12-byte transaction ID.
@@ -270,6 +342,143 @@ mod tests {
         let transaction_id = [0x42; 12];
         let result = parse_response(&[0, 1, 2], &transaction_id, Duration::from_millis(1));
         assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ClientError::Protocol(_)));
+    }
+
+    fn raw_attribute(raw_type: u16, value: &[u8]) -> stun_protocol::StunAttribute {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&raw_type.to_be_bytes());
+        bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(value);
+        stun_protocol::StunAttribute::decode(&bytes).unwrap()
+    }
+
+    fn error_response(transaction_id: [u8; 12], unknown: Option<Vec<u16>>) -> Vec<u8> {
+        use stun_protocol::{ErrorCode, UnknownAttributes};
+
+        let mut response = StunMessage::new(StunMessageType::ErrorIndication, transaction_id);
+        let code = ErrorCode::new(4, 20, "Unknown Attribute".to_string());
+        response.add_attribute(stun_protocol::StunAttribute::new(
+            StunAttributeType::ErrorCode,
+            code.encode_value(),
+        ));
+        if let Some(types) = unknown {
+            response.add_attribute(stun_protocol::StunAttribute::new(
+                StunAttributeType::UnknownAttributes,
+                UnknownAttributes::new(types).encode_value(),
+            ));
+        }
+        response.encode()
+    }
+
+    #[test]
+    fn test_parse_response_420_with_unknown_attributes() {
+        let transaction_id = [0x42; 12];
+        let bytes = error_response(transaction_id, Some(vec![0x0024]));
+
+        let err = parse_response(&bytes, &transaction_id, Duration::from_millis(1)).unwrap_err();
+
+        match err {
+            ClientError::ServerError {
+                class,
+                number,
+                reason,
+                unknown_attributes,
+            } => {
+                assert_eq!(class, 4);
+                assert_eq!(number, 20);
+                assert_eq!(reason, "Unknown Attribute");
+                assert_eq!(unknown_attributes, vec![0x0024]);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_response_420_without_unknown_attributes() {
+        let transaction_id = [0x42; 12];
+        let bytes = error_response(transaction_id, None);
+
+        let err = parse_response(&bytes, &transaction_id, Duration::from_millis(1)).unwrap_err();
+
+        match err {
+            ClientError::ServerError {
+                class,
+                number,
+                unknown_attributes,
+                ..
+            } => {
+                assert_eq!(class, 4);
+                assert_eq!(number, 20);
+                assert!(unknown_attributes.is_empty());
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_response_error_without_error_code() {
+        let transaction_id = [0x42; 12];
+        let response = StunMessage::new(StunMessageType::ErrorIndication, transaction_id);
+
+        let result = parse_response(
+            &response.encode(),
+            &transaction_id,
+            Duration::from_millis(1),
+        );
+        assert!(matches!(result.unwrap_err(), ClientError::Protocol(_)));
+    }
+
+    #[test]
+    fn test_parse_response_error_with_wrong_transaction_id() {
+        let bytes = error_response([0x42; 12], Some(vec![0x0024]));
+        let wrong_id = [0x99; 12];
+
+        let result = parse_response(&bytes, &wrong_id, Duration::from_millis(1));
+        assert!(matches!(result.unwrap_err(), ClientError::Protocol(_)));
+    }
+
+    #[test]
+    fn test_parse_response_success_with_unknown_optional_attribute() {
+        let transaction_id = [0x42; 12];
+        let mut response = StunMessage::new(StunMessageType::Response, transaction_id);
+        let mapped = MappedAddress::new("192.0.2.1".parse().unwrap(), 32853);
+        let xor_value = mapped.encode_xor(response.magic_cookie, &transaction_id);
+        response.add_attribute(stun_protocol::StunAttribute::new(
+            StunAttributeType::XorMappedAddress,
+            xor_value,
+        ));
+        response.add_attribute(raw_attribute(0x80FF, &[0xDE, 0xAD, 0xBE, 0xEF]));
+
+        let result = parse_response(
+            &response.encode(),
+            &transaction_id,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(
+            result.mapped_address,
+            "192.0.2.1:32853".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_response_success_with_unknown_required_attribute() {
+        let transaction_id = [0x42; 12];
+        let mut response = StunMessage::new(StunMessageType::Response, transaction_id);
+        let mapped = MappedAddress::new("192.0.2.1".parse().unwrap(), 32853);
+        let xor_value = mapped.encode_xor(response.magic_cookie, &transaction_id);
+        response.add_attribute(stun_protocol::StunAttribute::new(
+            StunAttributeType::XorMappedAddress,
+            xor_value,
+        ));
+        response.add_attribute(raw_attribute(0x0024, &[0x00, 0x00, 0x00, 0x00]));
+
+        let result = parse_response(
+            &response.encode(),
+            &transaction_id,
+            Duration::from_millis(1),
+        );
         assert!(matches!(result.unwrap_err(), ClientError::Protocol(_)));
     }
 }

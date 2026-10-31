@@ -215,6 +215,66 @@ fn test_xor_mapped_address_ipv4() {
 }
 
 #[test]
+fn test_decode_xor_exact_ipv4_length() {
+    let magic_cookie = 0x2112A442;
+    let transaction_id = [0u8; 12];
+
+    let mut value = vec![0x00, 0x01, 0x00, 0x00];
+    value.extend_from_slice(&[0u8; 4]);
+    assert_eq!(value.len(), 8);
+
+    assert!(MappedAddress::decode_xor(&value, magic_cookie, &transaction_id).is_ok());
+}
+
+#[test]
+fn test_decode_xor_exact_ipv6_length() {
+    let magic_cookie = 0x2112A442;
+    let transaction_id = [0u8; 12];
+
+    let mut value = vec![0x00, 0x02, 0x00, 0x00];
+    value.extend_from_slice(&[0u8; 16]);
+    assert_eq!(value.len(), 20);
+
+    assert!(MappedAddress::decode_xor(&value, magic_cookie, &transaction_id).is_ok());
+}
+
+#[test]
+fn test_decode_xor_ipv4_with_twenty_bytes_rejected() {
+    let magic_cookie = 0x2112A442;
+    let transaction_id = [0u8; 12];
+
+    let mut value = vec![0x00, 0x01, 0x00, 0x00];
+    value.extend_from_slice(&[0u8; 16]);
+
+    let err = MappedAddress::decode_xor(&value, magic_cookie, &transaction_id).unwrap_err();
+    assert!(matches!(err, StunError::MalformedMessage(_)));
+}
+
+#[test]
+fn test_decode_xor_ipv6_with_eight_bytes_rejected() {
+    let magic_cookie = 0x2112A442;
+    let transaction_id = [0u8; 12];
+
+    let mut value = vec![0x00, 0x02, 0x00, 0x00];
+    value.extend_from_slice(&[0u8; 4]);
+
+    let err = MappedAddress::decode_xor(&value, magic_cookie, &transaction_id).unwrap_err();
+    assert!(matches!(err, StunError::MalformedMessage(_)));
+}
+
+#[test]
+fn test_decode_xor_invalid_family_rejected() {
+    let magic_cookie = 0x2112A442;
+    let transaction_id = [0u8; 12];
+
+    let mut value = vec![0x00, 0x03, 0x00, 0x00];
+    value.extend_from_slice(&[0u8; 4]);
+
+    let err = MappedAddress::decode_xor(&value, magic_cookie, &transaction_id).unwrap_err();
+    assert!(matches!(err, StunError::MalformedMessage(_)));
+}
+
+#[test]
 fn test_error_types() {
     let err1 = StunError::InvalidMessageType(0x9999);
     assert!(format!("{}", err1).contains("Invalid message type"));
@@ -231,4 +291,82 @@ fn test_address_family_conversion() {
     assert_eq!(AddressFamily::from_raw(0x01).unwrap(), AddressFamily::IPv4);
     assert_eq!(AddressFamily::from_raw(0x02).unwrap(), AddressFamily::IPv6);
     assert!(AddressFamily::from_raw(0x03).is_err());
+}
+
+/// Encode a raw attribute (header + value + zero padding).
+fn raw_attribute_bytes(raw_type: u16, value: &[u8]) -> Vec<u8> {
+    let padding = (4 - value.len() % 4) % 4;
+    let mut bytes = Vec::with_capacity(4 + value.len() + padding);
+    bytes.extend_from_slice(&raw_type.to_be_bytes());
+    bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(value);
+    bytes.resize(bytes.len() + padding, 0);
+    bytes
+}
+
+/// Build a full Binding Request message carrying one raw attribute.
+fn message_with_raw_attribute(raw_type: u16, value: &[u8]) -> Vec<u8> {
+    let attribute = raw_attribute_bytes(raw_type, value);
+    let mut bytes = Vec::with_capacity(20 + attribute.len());
+    bytes.extend_from_slice(&0x0001u16.to_be_bytes());
+    bytes.extend_from_slice(&(attribute.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(&0x2112A442u32.to_be_bytes());
+    bytes.extend_from_slice(&[0x11; 12]);
+    bytes.extend_from_slice(&attribute);
+    bytes
+}
+
+#[test]
+fn test_message_integrity_accepts_twenty_byte_value() {
+    let attr = StunAttribute::decode(&raw_attribute_bytes(0x0008, &[0u8; 20])).unwrap();
+    assert_eq!(attr.raw_type, 0x0008);
+    assert_eq!(attr.attribute_length, 20);
+    assert_eq!(attr.attribute_value.len(), 20);
+}
+
+#[test]
+fn test_message_integrity_rejects_other_lengths() {
+    for len in [0usize, 4, 16, 19, 21, 24] {
+        let err = StunAttribute::decode(&raw_attribute_bytes(0x0008, &vec![0u8; len]))
+            .expect_err(&format!("MESSAGE-INTEGRITY length {len} must be rejected"));
+        assert!(
+            matches!(err, StunError::MalformedMessage(_)),
+            "MESSAGE-INTEGRITY length {len} must be MalformedMessage"
+        );
+    }
+}
+
+#[test]
+fn test_fingerprint_accepts_four_byte_value() {
+    let attr = StunAttribute::decode(&raw_attribute_bytes(0x8028, &[0u8; 4])).unwrap();
+    assert_eq!(attr.raw_type, 0x8028);
+    assert_eq!(attr.attribute_length, 4);
+}
+
+#[test]
+fn test_fingerprint_rejects_other_lengths() {
+    for len in [0usize, 2, 5, 8] {
+        let err = StunAttribute::decode(&raw_attribute_bytes(0x8028, &vec![0u8; len]))
+            .expect_err(&format!("FINGERPRINT length {len} must be rejected"));
+        assert!(
+            matches!(err, StunError::MalformedMessage(_)),
+            "FINGERPRINT length {len} must be MalformedMessage"
+        );
+    }
+}
+
+#[test]
+fn test_message_decode_validates_fixed_attribute_lengths() {
+    let valid = message_with_raw_attribute(0x0008, &[0u8; 20]);
+    let decoded = StunMessage::decode(&valid).unwrap();
+    assert_eq!(decoded.attributes[0].raw_type, 0x0008);
+
+    let invalid = message_with_raw_attribute(0x0008, &[0u8; 16]);
+    let err = StunMessage::decode(&invalid).expect_err("short MESSAGE-INTEGRITY must fail");
+    assert!(matches!(err, StunError::MalformedMessage(_)));
+
+    let invalid_fingerprint = message_with_raw_attribute(0x8028, &[0u8; 8]);
+    let err =
+        StunMessage::decode(&invalid_fingerprint).expect_err("oversized FINGERPRINT must fail");
+    assert!(matches!(err, StunError::MalformedMessage(_)));
 }

@@ -197,6 +197,13 @@ impl StunMessage {
             attributes.push(attr);
         }
 
+        if offset != end {
+            return Err(StunError::MalformedMessage(format!(
+                "Attribute parsing ended at offset {} but message ends at {}",
+                offset, end
+            )));
+        }
+
         Ok(Self {
             message_type,
             message_length,

@@ -9,18 +9,26 @@ use byteorder::{BigEndian, ByteOrder};
 pub enum StunAttributeType {
     /// MAPPED-ADDRESS attribute (RFC 5389)
     MappedAddress = 0x0001,
+    /// CHANGE-REQUEST attribute (RFC 5780)
+    ChangeRequest = 0x0003,
     /// ERROR-CODE attribute (RFC 5389)
     ErrorCode = 0x0009,
+    /// UNKNOWN-ATTRIBUTES attribute (RFC 5389)
+    UnknownAttributes = 0x000A,
     /// XOR-MAPPED-ADDRESS attribute (RFC 5389)
     XorMappedAddress = 0x0020,
+    /// PADDING attribute (RFC 5780)
+    Padding = 0x0026,
+    /// RESPONSE-PORT attribute (RFC 5780)
+    ResponsePort = 0x0027,
     /// SOFTWARE attribute (RFC 5389)
     Software = 0x8022,
-    /// SOURCE-ADDRESS attribute (RFC 5780)
-    SourceAddress = 0x802B,
-    /// CHANGED-ADDRESS attribute (RFC 5780)
-    ChangedAddress = 0x802C,
+    /// CACHE-TIMEOUT attribute (RFC 5780)
+    CacheTimeout = 0x8027,
+    /// RESPONSE-ORIGIN attribute (RFC 5780)
+    ResponseOrigin = 0x802B,
     /// OTHER-ADDRESS attribute (RFC 5780)
-    OtherAddress = 0x802D,
+    OtherAddress = 0x802C,
     /// Unknown attribute (for attributes we don't parse but can skip)
     Unknown = 0xFFFF,
 }
@@ -30,15 +38,27 @@ impl StunAttributeType {
     pub fn from_raw(value: u16) -> Self {
         match value {
             0x0001 => StunAttributeType::MappedAddress,
+            0x0003 => StunAttributeType::ChangeRequest,
             0x0009 => StunAttributeType::ErrorCode,
+            0x000A => StunAttributeType::UnknownAttributes,
             0x0020 => StunAttributeType::XorMappedAddress,
+            0x0026 => StunAttributeType::Padding,
+            0x0027 => StunAttributeType::ResponsePort,
             0x8022 => StunAttributeType::Software,
-            0x802B => StunAttributeType::SourceAddress,
-            0x802C => StunAttributeType::ChangedAddress,
-            0x802D => StunAttributeType::OtherAddress,
+            0x8027 => StunAttributeType::CacheTimeout,
+            0x802B => StunAttributeType::ResponseOrigin,
+            0x802C => StunAttributeType::OtherAddress,
             _ => StunAttributeType::Unknown,
         }
     }
+}
+
+/// Whether an attribute type is comprehension-required.
+///
+/// RFC 5389 section 15 divides the attribute space into a required range
+/// (`0x0000-0x7FFF`) and an optional range (`0x8000-0xFFFF`).
+pub fn is_comprehension_required(raw: u16) -> bool {
+    raw < 0x8000
 }
 
 /// STUN attribute structure
@@ -52,6 +72,11 @@ pub struct StunAttribute {
     pub attribute_length: u16,
     /// Attribute value (raw bytes)
     pub attribute_value: Vec<u8>,
+    /// Wire padding bytes following the value
+    ///
+    /// RFC 5389 section 15 allows padding to be any value; preserving it keeps
+    /// decode/encode round trips byte-identical.
+    pub padding: Vec<u8>,
 }
 
 impl StunAttribute {
@@ -63,6 +88,7 @@ impl StunAttribute {
             raw_type: attribute_type as u16,
             attribute_length: length,
             attribute_value: value,
+            padding: Vec::new(),
         }
     }
 
@@ -93,7 +119,11 @@ impl StunAttribute {
 
         // Padding to 4-byte boundary
         let padding = (4 - (self.attribute_length as usize % 4)) % 4;
-        buffer.extend(std::iter::repeat_n(0, padding));
+        if self.padding.len() == padding {
+            buffer.extend_from_slice(&self.padding);
+        } else {
+            buffer.extend(std::iter::repeat_n(0, padding));
+        }
 
         buffer
     }
@@ -111,6 +141,21 @@ impl StunAttribute {
 
         let attribute_length = BigEndian::read_u16(&data[2..4]);
 
+        // RFC 5389 sections 15.4 and 15.5 fix these value lengths.
+        match (attr_type_raw, attribute_length) {
+            (0x0008, len) if len != 20 => {
+                return Err(StunError::MalformedMessage(format!(
+                    "MESSAGE-INTEGRITY value must be 20 bytes, got {len}"
+                )));
+            }
+            (0x8028, len) if len != 4 => {
+                return Err(StunError::MalformedMessage(format!(
+                    "FINGERPRINT value must be 4 bytes, got {len}"
+                )));
+            }
+            _ => {}
+        }
+
         let value_end = 4 + attribute_length as usize;
         if data.len() < value_end {
             return Err(StunError::MalformedMessage(format!(
@@ -122,11 +167,80 @@ impl StunAttribute {
 
         let attribute_value = data[4..value_end].to_vec();
 
+        let padding_len = (4 - (attribute_length as usize % 4)) % 4;
+        let padding_end = value_end + padding_len;
+        if data.len() < padding_end {
+            return Err(StunError::MalformedMessage(format!(
+                "Attribute padding truncated: expected {} bytes, got {}",
+                padding_len,
+                data.len().saturating_sub(value_end)
+            )));
+        }
+        let padding = data[value_end..padding_end].to_vec();
+
         Ok(Self {
             attribute_type,
             raw_type: attr_type_raw,
             attribute_length,
             attribute_value,
+            padding,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_comprehension_required_range() {
+        assert!(is_comprehension_required(0x0000));
+        assert!(is_comprehension_required(0x0001));
+        assert!(is_comprehension_required(0x7FFF));
+        assert!(!is_comprehension_required(0x8000));
+        assert!(!is_comprehension_required(0x8022));
+        assert!(!is_comprehension_required(0xFFFF));
+    }
+
+    #[test]
+    fn test_rfc5780_attribute_registry() {
+        assert_eq!(
+            StunAttributeType::from_raw(0x0003),
+            StunAttributeType::ChangeRequest
+        );
+        assert_eq!(
+            StunAttributeType::from_raw(0x0026),
+            StunAttributeType::Padding
+        );
+        assert_eq!(
+            StunAttributeType::from_raw(0x0027),
+            StunAttributeType::ResponsePort
+        );
+        assert_eq!(
+            StunAttributeType::from_raw(0x8027),
+            StunAttributeType::CacheTimeout
+        );
+        assert_eq!(
+            StunAttributeType::from_raw(0x802B),
+            StunAttributeType::ResponseOrigin
+        );
+        assert_eq!(
+            StunAttributeType::from_raw(0x802C),
+            StunAttributeType::OtherAddress
+        );
+        assert_ne!(
+            StunAttributeType::from_raw(0x802D),
+            StunAttributeType::OtherAddress
+        );
+    }
+
+    #[test]
+    fn test_rfc5780_codepoints_are_wire_correct() {
+        assert_eq!(StunAttributeType::ChangeRequest as u16, 0x0003);
+        assert_eq!(StunAttributeType::Padding as u16, 0x0026);
+        assert_eq!(StunAttributeType::ResponsePort as u16, 0x0027);
+        assert_eq!(StunAttributeType::CacheTimeout as u16, 0x8027);
+        assert_eq!(StunAttributeType::ResponseOrigin as u16, 0x802B);
+        assert_eq!(StunAttributeType::OtherAddress as u16, 0x802C);
     }
 }

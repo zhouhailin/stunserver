@@ -28,7 +28,7 @@ async fn spawn_mock_server(respond_with: MockResponse) -> SocketAddr {
                 Err(_) => break,
             };
 
-            let response_bytes = match respond_with {
+            let response_bytes = match &respond_with {
                 MockResponse::Valid => {
                     let request = StunMessage::decode(&buf[..len]).unwrap();
                     let mut response =
@@ -52,6 +52,67 @@ async fn spawn_mock_server(respond_with: MockResponse) -> SocketAddr {
                     // Don't respond at all.
                     continue;
                 }
+                MockResponse::ServerError {
+                    types,
+                    include_list,
+                } => {
+                    let request = StunMessage::decode(&buf[..len]).unwrap();
+                    let mut response =
+                        StunMessage::new(StunMessageType::ErrorIndication, request.transaction_id);
+                    let code =
+                        stun_protocol::ErrorCode::new(4, 20, "Unknown Attribute".to_string());
+                    response.add_attribute(StunAttribute::new(
+                        StunAttributeType::ErrorCode,
+                        code.encode_value(),
+                    ));
+                    if *include_list {
+                        let list = stun_protocol::UnknownAttributes::new(types.clone());
+                        response.add_attribute(StunAttribute::new(
+                            StunAttributeType::UnknownAttributes,
+                            list.encode_value(),
+                        ));
+                    }
+                    response.encode()
+                }
+                MockResponse::SuccessWithRawAttribute { raw_type, value } => {
+                    let request = StunMessage::decode(&buf[..len]).unwrap();
+                    let mut response =
+                        StunMessage::new(StunMessageType::Response, request.transaction_id);
+                    let mapped = MappedAddress::new(from.ip(), from.port());
+                    let xor_value =
+                        mapped.encode_xor(response.magic_cookie, &response.transaction_id);
+                    response.add_attribute(StunAttribute::new(
+                        StunAttributeType::XorMappedAddress,
+                        xor_value,
+                    ));
+                    response.add_attribute(raw_attribute(*raw_type, value));
+                    response.encode()
+                }
+                MockResponse::WrongTransactionId => {
+                    let wrong_id = [0xAA; 12];
+                    let mut response = StunMessage::new(StunMessageType::Response, wrong_id);
+                    let mapped = MappedAddress::new(from.ip(), from.port());
+                    let xor_value = mapped.encode_xor(response.magic_cookie, &wrong_id);
+                    response.add_attribute(StunAttribute::new(
+                        StunAttributeType::XorMappedAddress,
+                        xor_value,
+                    ));
+                    response.encode()
+                }
+                MockResponse::Malformed => b"not a stun message".to_vec(),
+                MockResponse::BadXorLength => {
+                    let request = StunMessage::decode(&buf[..len]).unwrap();
+                    let mut response =
+                        StunMessage::new(StunMessageType::Response, request.transaction_id);
+                    // IPv4 family advertised with a 20-byte value.
+                    let mut value = vec![0x00, 0x01, 0x00, 0x00];
+                    value.extend_from_slice(&[0u8; 16]);
+                    response.add_attribute(StunAttribute::new(
+                        StunAttributeType::XorMappedAddress,
+                        value,
+                    ));
+                    response.encode()
+                }
             };
 
             let _ = socket.send_to(&response_bytes, from).await;
@@ -65,6 +126,19 @@ enum MockResponse {
     Valid,
     NoAttribute,
     Silent,
+    ServerError { types: Vec<u16>, include_list: bool },
+    SuccessWithRawAttribute { raw_type: u16, value: Vec<u8> },
+    WrongTransactionId,
+    Malformed,
+    BadXorLength,
+}
+
+fn raw_attribute(raw_type: u16, value: &[u8]) -> StunAttribute {
+    let mut bytes = Vec::with_capacity(4 + value.len());
+    bytes.extend_from_slice(&raw_type.to_be_bytes());
+    bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(value);
+    StunAttribute::decode(&bytes).unwrap()
 }
 
 #[tokio::test]
@@ -145,4 +219,125 @@ async fn test_binding_request_ipv6() {
         .unwrap();
 
     assert!(result.mapped_address.ip().is_loopback());
+}
+
+#[tokio::test]
+async fn test_binding_request_420_with_unknown_attributes() {
+    let server_addr = spawn_mock_server(MockResponse::ServerError {
+        types: vec![0x0024],
+        include_list: true,
+    })
+    .await;
+
+    let err = client::send_binding_request(server_addr, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+
+    match err {
+        client::ClientError::ServerError {
+            class,
+            number,
+            reason,
+            unknown_attributes,
+        } => {
+            assert_eq!(class, 4);
+            assert_eq!(number, 20);
+            assert_eq!(reason, "Unknown Attribute");
+            assert_eq!(unknown_attributes, vec![0x0024]);
+        }
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_binding_request_420_without_unknown_attributes() {
+    let server_addr = spawn_mock_server(MockResponse::ServerError {
+        types: vec![],
+        include_list: false,
+    })
+    .await;
+
+    let err = client::send_binding_request(server_addr, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+
+    match err {
+        client::ClientError::ServerError {
+            class,
+            number,
+            unknown_attributes,
+            ..
+        } => {
+            assert_eq!(class, 4);
+            assert_eq!(number, 20);
+            assert!(unknown_attributes.is_empty());
+        }
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_binding_request_success_with_unknown_optional_attribute() {
+    let server_addr = spawn_mock_server(MockResponse::SuccessWithRawAttribute {
+        raw_type: 0x80FF,
+        value: vec![0xDE, 0xAD, 0xBE, 0xEF],
+    })
+    .await;
+
+    let result = client::send_binding_request(server_addr, Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    assert!(result.mapped_address.port() > 0);
+}
+
+#[tokio::test]
+async fn test_binding_request_success_with_unknown_required_attribute() {
+    let server_addr = spawn_mock_server(MockResponse::SuccessWithRawAttribute {
+        raw_type: 0x0024,
+        value: vec![0x00, 0x00, 0x00, 0x00],
+    })
+    .await;
+
+    let err = client::send_binding_request(server_addr, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+
+    match err {
+        client::ClientError::Protocol(message) => assert!(message.contains("0x0024")),
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_binding_request_wrong_transaction_id() {
+    let server_addr = spawn_mock_server(MockResponse::WrongTransactionId).await;
+
+    let err = client::send_binding_request(server_addr, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, client::ClientError::Protocol(_)));
+}
+
+#[tokio::test]
+async fn test_binding_request_malformed_response() {
+    let server_addr = spawn_mock_server(MockResponse::Malformed).await;
+
+    let err = client::send_binding_request(server_addr, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, client::ClientError::Protocol(_)));
+}
+
+#[tokio::test]
+async fn test_binding_request_bad_xor_length() {
+    let server_addr = spawn_mock_server(MockResponse::BadXorLength).await;
+
+    let err = client::send_binding_request(server_addr, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, client::ClientError::Protocol(_)));
 }
