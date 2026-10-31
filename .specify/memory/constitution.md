@@ -1,13 +1,16 @@
 <!--
 Sync Impact Report
 ==================
-Version change: N/A → 1.0.0 (initial ratification)
-Modified principles: N/A (initial creation)
-Added sections:
-  - Core Principles (5 principles)
-  - Technology Stack
-  - Development Workflow
-  - Governance
+Version change: 1.0.0 → 1.1.0 (MINOR: materially expanded quality-gate
+guidance and added a CI parity principle)
+Modified principles:
+  - IV. Code Quality Gates: commands now match GitHub Actions exactly
+    (all targets/features, formatting check, workspace-wide tests)
+Added principles:
+  - VI. CI Parity and Pre-Push Verification
+Modified sections:
+  - Technology Stack: linting scope clarified
+  - Development Workflow: PR verification commands aligned with CI
 Removed sections: N/A
 Follow-up TODOs: None
 -->
@@ -61,14 +64,17 @@ communication. Latency and throughput directly affect user experience.
 
 All code MUST pass the following quality gates before merge:
 
-- `cargo fmt` — formatting MUST match rustfmt defaults
-- `cargo clippy -- -D warnings` — zero clippy warnings allowed
-- `cargo test` — all tests MUST pass
+- `cargo fmt --all -- --check` — formatting MUST match rustfmt defaults
+- `cargo clippy --all-targets --all-features -- -D warnings` — zero
+  clippy warnings allowed, including in test, benchmark, and example
+  targets
+- `cargo test --all` — all tests in the workspace MUST pass
 - No `unsafe` blocks without explicit justification and review
 
 **Rationale**: Consistent code quality reduces review burden and
 prevents entire categories of bugs. Rust's type system is our
-primary safety net; `unsafe` bypasses that guarantee.
+primary safety net; `unsafe` bypasses that guarantee. Linting test
+targets matters because CI checks them even when local builds do not.
 
 ### V. Simplicity and YAGNI
 
@@ -80,13 +86,36 @@ need is demonstrated. Every line of code is a liability — minimize it.
 primary sources of complexity. A simple, correct implementation
 is always preferred over a clever, complex one.
 
+### VI. CI Parity and Pre-Push Verification
+
+Local verification MUST mirror the GitHub Actions CI before a commit
+is pushed to a shared branch. The minimum local gate is:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all`
+- `cargo build --release`
+
+A successful `cargo build` or `cargo test` alone is NOT sufficient
+evidence: clippy warnings in `#[cfg(test)]` code still fail CI.
+When a change touches `docker/Dockerfile`, the Rust toolchain version,
+or `Cargo.lock`, a Docker build MUST be verified before pushing, and
+the builder toolchain MUST be able to parse the committed
+`Cargo.lock` format. A commit with known failing CI-equivalent checks
+MUST NOT be pushed.
+
+**Rationale**: Past CI failures came from clippy lints in test-only
+code and from a Docker builder whose Cargo version could not read the
+committed lockfile format. Running the exact CI commands locally
+prevents avoidable red builds and keeps `main` verifiable.
+
 ## Technology Stack
 
 - **Language**: Rust (stable toolchain, latest edition)
 - **Build**: Cargo (standard build, test, fmt, clippy commands)
 - **Async Runtime**: Tokio (for network I/O)
 - **Testing**: cargo test + integration tests in `tests/`
-- **Linting**: clippy with all warnings as errors
+- **Linting**: clippy across all targets and features, warnings as errors
 - **Formatting**: rustfmt with default configuration
 
 ## Development Workflow
@@ -96,9 +125,11 @@ is always preferred over a clever, complex one.
 - **Branches**: `type/description` (e.g., `feat/stun-binding`,
   `fix/attribute-parsing`)
 - **Pull Requests**: All changes require review. Verify:
-  - Tests pass (`cargo test`)
-  - No clippy warnings (`cargo clippy -- -D warnings`)
-  - Code formatted (`cargo fmt --check`)
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+  - `cargo test --all`
+  - Docker build when Dockerfile, toolchain, or lockfile changes
+    (Principle VI)
   - RFC compliance verified for protocol changes
 - **Verification**: Run `/verify` skill before marking tasks complete
 
@@ -115,4 +146,4 @@ conventions. Amendments require:
 All contributors MUST verify compliance with this constitution
 during code review. Violations MUST be fixed before merge.
 
-**Version**: 1.0.0 | **Ratified**: 2026-10-29 | **Last Amended**: 2026-10-29
+**Version**: 1.1.0 | **Ratified**: 2026-10-29 | **Last Amended**: 2026-10-31
