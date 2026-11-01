@@ -80,7 +80,7 @@ update_versions() {
             # Update version field
             sed -i "s/^version\s*=\s*\".*\"/version = \"$new_version\"/" "$file"
             success "Updated $file"
-            ((files_updated++))
+            files_updated=$((files_updated + 1))
         fi
     done < <(find . -name "Cargo.toml" -not -path "./target/*" -print0)
     
