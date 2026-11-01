@@ -8,6 +8,8 @@
 INSTALL_DIR = /opt/stunserver
 SERVICE_NAME = stunserver
 SYSTEMD_DIR = /etc/systemd/system
+SYSCTL_DIR = /etc/sysctl.d
+SYSCTL_FILE = 99-stunserver.conf
 
 # Install STUN server
 install:
@@ -41,6 +43,10 @@ install:
 	else \
 		echo "Configuration file already exists, skipping"; \
 	fi
+	@# Install kernel tuning parameters
+	@cp ../systemd/$(SYSCTL_FILE) $(SYSCTL_DIR)/$(SYSCTL_FILE)
+	@sysctl --system >/dev/null
+	@echo "Installed kernel tuning: $(SYSCTL_DIR)/$(SYSCTL_FILE)"
 	@# Copy systemd service
 	@cp ../systemd/stunserver.service $(SYSTEMD_DIR)/$(SERVICE_NAME).service
 	@echo "Installed systemd service"
@@ -83,6 +89,9 @@ uninstall:
 	@rm -f $(SYSTEMD_DIR)/$(SERVICE_NAME).service
 	@systemctl daemon-reload
 	@echo "Removed systemd service"
+	@# Remove kernel tuning file; current values stay until reboot
+	@rm -f $(SYSCTL_DIR)/$(SYSCTL_FILE)
+	@echo "Removed kernel tuning: $(SYSCTL_DIR)/$(SYSCTL_FILE)"
 	@# Remove installation directory
 	@if [ -d $(INSTALL_DIR) ]; then \
 		rm -rf $(INSTALL_DIR); \

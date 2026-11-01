@@ -52,7 +52,7 @@ make package
 # Build first
 make build
 
-# Install (requires root)
+# Install (requires root; also installs /etc/sysctl.d/99-stunserver.conf)
 cd deploy
 sudo make install
 
@@ -62,6 +62,10 @@ sudo make start
 # Check status
 sudo make status
 ```
+
+`make install` also applies the kernel UDP buffer limits from
+`systemd/99-stunserver.conf`; see [System Tuning](#system-tuning) for the values,
+verification, and container notes.
 
 ### Docker Deployment
 
@@ -89,7 +93,7 @@ The server uses a TOML configuration file located at `/opt/stunserver/etc/stunse
 listen_address = "0.0.0.0"
 port = 3478
 worker_threads = 0  # 0 = auto-detect CPU cores
-max_connections = 10000
+max_connections = 10000  # max in-flight request handlers; excess datagrams are dropped
 
 [logging]
 level = "info"
@@ -106,6 +110,11 @@ udp_send_buffer_size = 1048576
 tcp_connection_timeout_sec = 30
 tcp_idle_timeout_sec = 300
 ```
+
+`udp_recv_buffer_size` and `udp_send_buffer_size` are applied as `SO_RCVBUF`/`SO_SNDBUF`
+when the socket is created. The kernel silently caps them at `net.core.rmem_max` and
+`net.core.wmem_max`; see [System Tuning](#system-tuning) for the recommended limits,
+persistence, and the systemd resource settings.
 
 ### Environment Variables (Docker)
 
@@ -134,7 +143,9 @@ password = "change-me"
 # nonce_lifetime_sec = 600
 ```
 
-With `long-term`, the client first receives an unsigned 401 challenge carrying REALM and NONCE and then retries with a signed request. A stale NONCE yields 438 with a fresh NONCE; the client retries at most twice. `nonce_lifetime_sec` must be between 1 and 86400.
+With `long-term`, the client first receives an unsigned 401 challenge carrying REALM and NONCE and then retries with a signed request. A stale NONCE yields 438 with a fresh NONCE, which the client adopts for at most two signed retries; a 401 after a signed request is terminal because retrying without changing credentials is forbidden by RFC 5389 §10.2.3. `nonce_lifetime_sec` must be between 1 and 86400.
+
+USERNAME, REALM, and passwords are processed with SASLprep (RFC 5389 §15.3, §15.4, §15.7); USERNAME is limited to 512 bytes and REALM/NONCE to fewer than 128 characters. The bundled UDP client retransmits requests with a 500 ms initial RTO that doubles for at most seven transmissions, then waits 16×RTO (8 s) for the final response; `--timeout` is a hard cap on the whole exchange (§7.2.1). Responses from another source, with a mismatched transaction ID, or failing validation are silently discarded while the exchange waits for a valid response (§7.3.3, §10.1.3). A 400 error is accepted without MESSAGE-INTEGRITY because the server may not be able to compute one (§15.6). REALM/NONCE caching (§10.2.1.2) and RTO caching per server (§7.2.1) are not applicable: `stunclient` performs a single discovery exchange per invocation.
 
 The configuration file stores passwords in plaintext, so restrict it to the service account:
 
@@ -148,7 +159,52 @@ Never commit production credentials. For the bundled client, prefer `STUNCLIENT_
 STUNCLIENT_PASSWORD='change-me' stunclient --auth-mode long-term --username alice stun.example.org:3478
 ```
 
+`--realm` overrides the REALM proposed by a long-term challenge for diagnostics; the challenge NONCE is still used. A live server derives its key from its configured realm, so a mismatched override normally produces 401.
+
 MESSAGE-INTEGRITY provides integrity only; UDP traffic is not encrypted.
+
+## System Tuning
+
+High packet rates need kernel-side headroom in addition to the `[network]` settings. The
+recommended values are shipped in `systemd/99-stunserver.conf` and installed to
+`/etc/sysctl.d/99-stunserver.conf` by `deploy/Makefile`:
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `net.core.rmem_max` | `16777216` | Upper bound for `SO_RCVBUF`; without it the configured `udp_recv_buffer_size` is silently capped (often at 212992 bytes, a few milliseconds of traffic at tens of thousands of packets per second). |
+| `net.core.wmem_max` | `16777216` | Upper bound for `SO_SNDBUF`; same cap for `udp_send_buffer_size`. |
+| `net.core.netdev_max_backlog` | `16384` | Queue between the NIC driver and the network stack; enlarge it when bursts are dropped in the "dropped" column of `/proc/net/softnet_stat`. |
+
+Apply and verify:
+
+```bash
+sudo cp systemd/99-stunserver.conf /etc/sysctl.d/99-stunserver.conf
+sudo sysctl --system
+sysctl net.core.rmem_max net.core.wmem_max net.core.netdev_max_backlog
+```
+
+The kernel accounts roughly twice the requested socket size internally, so a 4 MiB request
+is bounded by `2 x net.core.rmem_max` / `2 x net.core.wmem_max`. In containers these limits
+come from the host kernel: set them on the host (containers share the network namespace
+settings unless a separate netns is configured). `stunbench` requests 4 MiB buffers for its
+own UDP socket and is subject to the same caps.
+
+The systemd unit (`systemd/stunserver.service`) adds `LimitNOFILE=1048576` and writes to the
+journal. Kernel limits are global, so restart the service after changing the sysctl drop-in
+or `[network]` buffer sizes to recreate the listening socket with the new values:
+
+```bash
+sudo systemctl restart stunserver
+```
+
+Removing `/etc/sysctl.d/99-stunserver.conf` stops future boots from raising the limits, but
+already running sessions keep the current values until reboot.
+
+### Example: 50k QPS benchmark
+
+With the values above applied and `udp_recv_buffer_size`/`udp_send_buffer_size` set to
+1048576, `stunbench --qps 50000` completed 3,000,000 requests with 0 failures and
+p99 = 0.92 ms on a loopback test.
 
 ## Directory Structure
 
@@ -317,9 +373,9 @@ stunserver/
 │   └── bench/          # Benchmarking tools
 ├── crates/
 │   └── stun-protocol/  # Protocol implementation
-├── deploy/             # Deployment scripts
+├── deploy/             # Deployment scripts (systemd installer, config example)
 ├── docker/             # Docker files
-├── systemd/            # Systemd service file
+├── systemd/            # Systemd unit and kernel tuning drop-in
 └── .github/workflows/  # CI/CD workflows
 ```
 

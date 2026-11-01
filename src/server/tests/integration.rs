@@ -239,10 +239,12 @@ async fn test_stun_binding_request_response() {
 
 /// Build a StunAttribute from a raw type code and value.
 fn raw_attribute(raw_type: u16, value: &[u8]) -> stun_protocol::StunAttribute {
-    let mut bytes = Vec::with_capacity(4 + value.len());
+    let padding = (4 - value.len() % 4) % 4;
+    let mut bytes = Vec::with_capacity(4 + value.len() + padding);
     bytes.extend_from_slice(&raw_type.to_be_bytes());
     bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
     bytes.extend_from_slice(value);
+    bytes.resize(bytes.len() + padding, 0);
     stun_protocol::StunAttribute::decode(&bytes).expect("raw attribute")
 }
 
@@ -298,7 +300,7 @@ async fn exchange(attributes: Vec<stun_protocol::StunAttribute>) -> stun_protoco
 async fn test_unknown_required_attribute_gets_420() {
     let response = exchange(vec![raw_attribute(0x0024, &[0x00, 0x00, 0x00, 0x01])]).await;
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(response.attributes.len(), 3);
     assert_eq!(
         response.attributes[2].attribute_type,
@@ -330,7 +332,7 @@ async fn test_duplicate_unknown_required_attributes_deduplicated() {
     ])
     .await;
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     let unknown =
         stun_protocol::UnknownAttributes::decode_value(&response.attributes[1].attribute_value)
             .unwrap();
@@ -360,7 +362,7 @@ async fn test_rfc5780_unsupported_attributes_get_420() {
 
         assert_eq!(
             response.message_type,
-            StunMessageType::ErrorIndication,
+            StunMessageType::ErrorResponse,
             "attribute 0x{raw_type:04X} must be rejected"
         );
 
@@ -373,6 +375,168 @@ async fn test_rfc5780_unsupported_attributes_get_420() {
                 .expect("UNKNOWN-ATTRIBUTES decodes");
         assert_eq!(unknown.types, vec![raw_type]);
     }
+}
+
+/// Decode the UNKNOWN-ATTRIBUTES list from a 420 response.
+fn unknown_attribute_types(response: &StunMessage) -> Vec<u16> {
+    let attribute = response
+        .attributes
+        .iter()
+        .find(|attr| attr.attribute_type == StunAttributeType::UnknownAttributes)
+        .expect("UNKNOWN-ATTRIBUTES present");
+    UnknownAttributes::decode_value(&attribute.attribute_value)
+        .expect("UNKNOWN-ATTRIBUTES decodes")
+        .types
+}
+
+#[tokio::test]
+async fn test_rfc5780_change_request_with_flags_rejected() {
+    // CHANGE-REQUEST with the change-IP and change-port bits set (RFC 5780 §7.2).
+    let response = exchange(vec![raw_attribute(0x0003, &[0x00, 0x00, 0x00, 0x06])]).await;
+
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
+    assert_eq!(error_status(&response), 420);
+    assert_eq!(unknown_attribute_types(&response), vec![0x0003]);
+}
+
+#[tokio::test]
+async fn test_rfc5780_padding_of_any_length_rejected() {
+    // PADDING is free-form (RFC 5780 §7.6): every length must be refused
+    // without echoing the padding back.
+    for value_len in [0usize, 1, 5, 32] {
+        let padding = vec![0u8; value_len];
+        let response = exchange(vec![raw_attribute(0x0026, &padding)]).await;
+
+        assert_eq!(
+            response.message_type,
+            StunMessageType::ErrorResponse,
+            "PADDING of {value_len} bytes must be rejected"
+        );
+        assert_eq!(error_status(&response), 420);
+        assert_eq!(unknown_attribute_types(&response), vec![0x0026]);
+    }
+}
+
+#[tokio::test]
+async fn test_rfc5780_response_port_rejected() {
+    // RESPONSE-PORT 8080 with its two padding bytes, plus a short value to
+    // show interception does not depend on value validation.
+    for value in [&[0x1F, 0x90, 0x00, 0x00][..], &[0x1F, 0x90][..]] {
+        let response = exchange(vec![raw_attribute(0x0027, value)]).await;
+
+        assert_eq!(response.message_type, StunMessageType::ErrorResponse);
+        assert_eq!(error_status(&response), 420);
+        assert_eq!(unknown_attribute_types(&response), vec![0x0027]);
+    }
+}
+
+#[tokio::test]
+async fn test_rfc5780_padding_with_response_port_rejected_listing_both() {
+    // RFC 5780 §6.1 asks a supporting server to answer 400 here. This server
+    // offers no behavior discovery and keeps the RFC 5389 §7.3.1 420 form
+    // (documented deviation in specs/007-stun-rfc-error-handling/spec.md).
+    let response = exchange(vec![
+        raw_attribute(0x0026, &[0u8; 8]),
+        raw_attribute(0x0027, &[0x1F, 0x90, 0x00, 0x00]),
+    ])
+    .await;
+
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
+    assert_eq!(error_status(&response), 420);
+    assert_eq!(unknown_attribute_types(&response), vec![0x0026, 0x0027]);
+}
+
+#[tokio::test]
+async fn test_rfc5780_and_unknown_types_listed_once_in_first_seen_order() {
+    let response = exchange(vec![
+        raw_attribute(0x0003, &[0x00, 0x00, 0x00, 0x06]),
+        raw_attribute(0x0024, &[0x00, 0x00, 0x00, 0x01]),
+        raw_attribute(0x0026, &[0u8; 4]),
+        raw_attribute(0x0003, &[0x00, 0x00, 0x00, 0x02]),
+        raw_attribute(0x0027, &[0x1F, 0x90, 0x00, 0x00]),
+    ])
+    .await;
+
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
+    assert_eq!(error_status(&response), 420);
+    assert_eq!(
+        unknown_attribute_types(&response),
+        vec![0x0003, 0x0024, 0x0026, 0x0027]
+    );
+}
+
+#[tokio::test]
+async fn test_rfc5780_attributes_after_integrity_ignored() {
+    let mut message = StunMessage::new(StunMessageType::Request, [0x70; 12]);
+    message.add_attribute(StunAttribute::new(
+        StunAttributeType::MessageIntegrity,
+        vec![0u8; 20],
+    ));
+    message.add_attribute(raw_attribute(0x0003, &[0x00, 0x00, 0x00, 0x06]));
+    message.add_attribute(raw_attribute(0x0026, &[0u8; 4]));
+
+    let (response, _) = exchange_with_service(disabled_service(), message.encode())
+        .await
+        .expect("attributes after MESSAGE-INTEGRITY are ignored");
+
+    assert_eq!(
+        response.message_type,
+        StunMessageType::Response,
+        "RFC 5780 attributes after MESSAGE-INTEGRITY must not trigger 420"
+    );
+}
+
+#[tokio::test]
+async fn test_rfc5780_authenticated_420_is_signed() {
+    let service = auth_service(SHORT_TERM_CONFIG);
+    let key = short_term_key("s3cret").unwrap();
+    let request = request_bytes(
+        vec![
+            StunAttribute::new(StunAttributeType::Username, b"alice".to_vec()),
+            raw_attribute(0x0003, &[0x00, 0x00, 0x00, 0x06]),
+        ],
+        Some(&key),
+    );
+
+    let (response, bytes) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
+    assert_eq!(error_status(&response), 420);
+    assert_eq!(unknown_attribute_types(&response), vec![0x0003]);
+    assert_eq!(
+        response.attributes.last().unwrap().attribute_type,
+        StunAttributeType::MessageIntegrity
+    );
+    assert!(StunMessage::verify_message_integrity(&bytes, &key));
+}
+
+#[tokio::test]
+async fn test_rfc5780_interception_loses_to_authentication_failure() {
+    let service = auth_service(LONG_TERM_CONFIG);
+    let mut message = StunMessage::new(StunMessageType::Request, [0x71; 12]);
+    message.add_attribute(raw_attribute(0x0003, &[0x00, 0x00, 0x00, 0x06]));
+
+    let (response, _) = exchange_with_service(service, message.encode())
+        .await
+        .expect("enabled authentication must answer with a challenge");
+
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
+    assert_eq!(
+        error_status(&response),
+        401,
+        "authentication failures must take precedence over interception"
+    );
+    assert!(!has_type(&response, StunAttributeType::UnknownAttributes));
+}
+
+#[tokio::test]
+async fn test_rfc5780_optional_cache_timeout_ignored() {
+    // CACHE-TIMEOUT 0x8027 is comprehension-optional; the server ignores it.
+    let response = exchange(vec![raw_attribute(0x8027, &[0x00, 0x00, 0x00, 0x1E])]).await;
+
+    assert_eq!(response.message_type, StunMessageType::Response);
 }
 
 #[tokio::test]
@@ -403,7 +567,7 @@ async fn test_mixed_request_lists_only_unknown_required_types() {
     ])
     .await;
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     let unknown = UnknownAttributes::decode_value(&response.attributes[1].attribute_value).unwrap();
     assert_eq!(unknown.types, vec![0x0024, 0x0025]);
 }
@@ -462,7 +626,7 @@ async fn test_responses_never_contain_other_address() {
         .all(|attr| attr.raw_type != 0x802C));
 
     let error = exchange(vec![raw_attribute(0x0003, &[0x00, 0x00, 0x00, 0x06])]).await;
-    assert_eq!(error.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(error.message_type, StunMessageType::ErrorResponse);
     assert!(error.attributes.iter().all(|attr| attr.raw_type != 0x802C));
 }
 
@@ -617,7 +781,7 @@ fn assert_failure_has_no_integrity(response: &StunMessage) {
 #[tokio::test]
 async fn test_auth_short_term_success_is_signed() {
     let service = auth_service(SHORT_TERM_CONFIG);
-    let key = short_term_key("s3cret");
+    let key = short_term_key("s3cret").unwrap();
     let request = request_bytes(
         vec![StunAttribute::new(
             StunAttributeType::Username,
@@ -651,7 +815,7 @@ async fn test_auth_short_term_missing_credentials_400() {
         .await
         .expect("response");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(error_status(&response), 400);
     assert_main_types(&response);
     assert_failure_has_no_integrity(&response);
@@ -665,14 +829,14 @@ async fn test_auth_short_term_unknown_user_401() {
             StunAttributeType::Username,
             b"bob".to_vec(),
         )],
-        Some(&short_term_key("anything")),
+        Some(&short_term_key("anything").unwrap()),
     );
 
     let (response, _) = exchange_with_service(service, request)
         .await
         .expect("response");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(error_status(&response), 401);
     assert_main_types(&response);
     assert_failure_has_no_integrity(&response);
@@ -686,14 +850,14 @@ async fn test_auth_short_term_bad_mac_401() {
             StunAttributeType::Username,
             b"alice".to_vec(),
         )],
-        Some(&short_term_key("wrong-secret")),
+        Some(&short_term_key("wrong-secret").unwrap()),
     );
 
     let (response, _) = exchange_with_service(service, request)
         .await
         .expect("response");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(error_status(&response), 401);
     assert_main_types(&response);
     assert_failure_has_no_integrity(&response);
@@ -708,7 +872,7 @@ async fn test_auth_long_term_missing_integrity_401_with_challenge() {
         .await
         .expect("response");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(error_status(&response), 401);
     assert_eq!(
         attribute_value(&response, StunAttributeType::Realm).as_deref(),
@@ -739,9 +903,173 @@ async fn test_auth_long_term_integrity_without_nonce_400() {
         .await
         .expect("response");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(error_status(&response), 400);
     assert_main_types(&response);
+    assert_failure_has_no_integrity(&response);
+}
+
+#[tokio::test]
+async fn test_auth_long_term_missing_username_400() {
+    let service = auth_service(LONG_TERM_CONFIG);
+    let nonce = service.issue_nonce();
+    let key = long_term_key("alice", "example.org", "change-me").unwrap();
+
+    let request = request_bytes(
+        vec![
+            StunAttribute::new(StunAttributeType::Realm, b"example.org".to_vec()),
+            StunAttribute::new(StunAttributeType::Nonce, nonce.into_bytes()),
+        ],
+        Some(&key),
+    );
+
+    let (response, _) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    // RFC 5389 section 10.2.2: a missing USERNAME is a 400 without a challenge.
+    assert_eq!(error_status(&response), 400);
+    assert!(!has_type(&response, StunAttributeType::Realm));
+    assert!(!has_type(&response, StunAttributeType::Nonce));
+    assert_failure_has_no_integrity(&response);
+}
+
+#[tokio::test]
+async fn test_auth_long_term_empty_username_401_with_challenge() {
+    let service = auth_service(LONG_TERM_CONFIG);
+    let nonce = service.issue_nonce();
+    let key = long_term_key("alice", "example.org", "change-me").unwrap();
+
+    let request = request_bytes(
+        vec![
+            StunAttribute::new(StunAttributeType::Username, Vec::new()),
+            StunAttribute::new(StunAttributeType::Realm, b"example.org".to_vec()),
+            StunAttribute::new(StunAttributeType::Nonce, nonce.into_bytes()),
+        ],
+        Some(&key),
+    );
+
+    let (response, _) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    // RFC 5389 section 10.2.2: a present but invalid USERNAME is a 401.
+    assert_eq!(error_status(&response), 401);
+    assert_eq!(
+        attribute_value(&response, StunAttributeType::Realm).as_deref(),
+        Some(b"example.org".as_slice())
+    );
+    assert!(has_type(&response, StunAttributeType::Nonce));
+    assert_failure_has_no_integrity(&response);
+}
+
+#[tokio::test]
+async fn test_auth_long_term_non_utf8_username_401_with_challenge() {
+    let service = auth_service(LONG_TERM_CONFIG);
+    let nonce = service.issue_nonce();
+    let key = long_term_key("alice", "example.org", "change-me").unwrap();
+
+    let request = request_bytes(
+        vec![
+            StunAttribute::new(StunAttributeType::Username, vec![0xFF, 0xFE]),
+            StunAttribute::new(StunAttributeType::Realm, b"example.org".to_vec()),
+            StunAttribute::new(StunAttributeType::Nonce, nonce.into_bytes()),
+        ],
+        Some(&key),
+    );
+
+    let (response, _) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    assert_eq!(error_status(&response), 401);
+    assert!(has_type(&response, StunAttributeType::Realm));
+    assert!(has_type(&response, StunAttributeType::Nonce));
+    assert_failure_has_no_integrity(&response);
+}
+
+#[tokio::test]
+async fn test_auth_long_term_invalid_realm_401_with_challenge() {
+    let service = auth_service(LONG_TERM_CONFIG);
+    let nonce = service.issue_nonce();
+    let key = long_term_key("alice", "example.org", "change-me").unwrap();
+
+    let request = request_bytes(
+        vec![
+            StunAttribute::new(StunAttributeType::Username, b"alice".to_vec()),
+            StunAttribute::new(StunAttributeType::Realm, vec![0xFF, 0xFE]),
+            StunAttribute::new(StunAttributeType::Nonce, nonce.into_bytes()),
+        ],
+        Some(&key),
+    );
+
+    let (response, _) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    assert_eq!(error_status(&response), 401);
+    assert!(has_type(&response, StunAttributeType::Realm));
+    assert!(has_type(&response, StunAttributeType::Nonce));
+    assert_failure_has_no_integrity(&response);
+}
+
+#[tokio::test]
+async fn test_auth_long_term_present_invalid_nonce_438() {
+    let service = auth_service(LONG_TERM_CONFIG);
+    let key = long_term_key("alice", "example.org", "change-me").unwrap();
+
+    let request = request_bytes(
+        vec![
+            StunAttribute::new(StunAttributeType::Username, b"alice".to_vec()),
+            StunAttribute::new(StunAttributeType::Realm, b"example.org".to_vec()),
+            StunAttribute::new(StunAttributeType::Nonce, b"not-a-nonce".to_vec()),
+        ],
+        Some(&key),
+    );
+
+    let (response, _) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    // RFC 5389 section 10.2.2: a NONCE that is no longer valid yields 438.
+    assert_eq!(error_status(&response), 438);
+    assert!(has_type(&response, StunAttributeType::Nonce));
+    assert_failure_has_no_integrity(&response);
+}
+
+#[tokio::test]
+async fn test_auth_short_term_empty_username_401() {
+    let service = auth_service(SHORT_TERM_CONFIG);
+    let request = request_bytes(
+        vec![StunAttribute::new(StunAttributeType::Username, Vec::new())],
+        Some(&short_term_key("anything").unwrap()),
+    );
+
+    let (response, _) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    // RFC 5389 section 10.1.2: an invalid USERNAME value is a 401.
+    assert_eq!(error_status(&response), 401);
+    assert_failure_has_no_integrity(&response);
+}
+
+#[tokio::test]
+async fn test_auth_short_term_non_utf8_username_401() {
+    let service = auth_service(SHORT_TERM_CONFIG);
+    let request = request_bytes(
+        vec![StunAttribute::new(
+            StunAttributeType::Username,
+            vec![0xFF, 0xFE],
+        )],
+        Some(&short_term_key("anything").unwrap()),
+    );
+
+    let (response, _) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    assert_eq!(error_status(&response), 401);
     assert_failure_has_no_integrity(&response);
 }
 
@@ -765,7 +1093,7 @@ async fn test_auth_long_term_stale_nonce_438_with_fresh_challenge() {
         .await
         .expect("response");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(error_status(&response), 438);
     assert_eq!(
         attribute_value(&response, StunAttributeType::Realm).as_deref(),
@@ -886,7 +1214,7 @@ async fn test_auth_long_term_success_is_signed() {
 #[tokio::test]
 async fn test_auth_authenticated_420_is_signed() {
     let service = auth_service(SHORT_TERM_CONFIG);
-    let key = short_term_key("s3cret");
+    let key = short_term_key("s3cret").unwrap();
     let request = request_bytes(
         vec![
             StunAttribute::new(StunAttributeType::Username, b"alice".to_vec()),
@@ -899,7 +1227,7 @@ async fn test_auth_authenticated_420_is_signed() {
         .await
         .expect("response");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(error_status(&response), 420);
     let unknown = response
         .attributes
@@ -926,7 +1254,7 @@ async fn test_auth_enabled_modes_never_succeed_unauthenticated() {
             .expect("enabled mode must answer the challenge");
         assert_eq!(
             response.message_type,
-            StunMessageType::ErrorIndication,
+            StunMessageType::ErrorResponse,
             "unauthenticated request must not succeed in an enabled mode"
         );
         assert!(matches!(error_status(&response), 400 | 401));
@@ -960,6 +1288,78 @@ password = "{decomposed_password}"
             StunAttribute::new(StunAttributeType::Realm, b"example.org".to_vec()),
             StunAttribute::new(StunAttributeType::Nonce, nonce.into_bytes()),
         ],
+        Some(&key),
+    );
+
+    let (response, bytes) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    assert_eq!(response.message_type, StunMessageType::Response);
+    assert!(StunMessage::verify_message_integrity(&bytes, &key));
+}
+
+#[tokio::test]
+async fn test_auth_long_term_non_ascii_username_and_realm_saslprep_end_to_end() {
+    // RFC 5389 sections 15.3 and 15.7 require SASLprep for USERNAME and REALM.
+    // The server stores the decomposed spellings; the client sends the
+    // precomposed ones and must derive the same key.
+    let config_toml = format!(
+        r#"
+[auth]
+mode = "long-term"
+realm = "{}"
+
+[[auth.users]]
+username = "{}"
+password = "s3cret"
+"#,
+        "exa\u{0308}mple.org", "jose\u{0301}"
+    );
+    let service = auth_service(&config_toml);
+    let key = long_term_key("josé", "exämple.org", "s3cret").unwrap();
+    let nonce = service.issue_nonce();
+
+    let request = request_bytes(
+        vec![
+            StunAttribute::new(StunAttributeType::Username, "josé".as_bytes().to_vec()),
+            StunAttribute::new(StunAttributeType::Realm, "exämple.org".as_bytes().to_vec()),
+            StunAttribute::new(StunAttributeType::Nonce, nonce.into_bytes()),
+        ],
+        Some(&key),
+    );
+
+    let (response, bytes) = exchange_with_service(service, request)
+        .await
+        .expect("response");
+
+    assert_eq!(response.message_type, StunMessageType::Response);
+    assert!(StunMessage::verify_message_integrity(&bytes, &key));
+}
+
+#[tokio::test]
+async fn test_auth_short_term_non_ascii_password_saslprep_end_to_end() {
+    // RFC 5389 section 15.4: the short-term key is SASLprep(password), so a
+    // password containing a soft hyphen authenticates as its mapped form.
+    let config_toml = format!(
+        r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "dave"
+password = "{}"
+"#,
+        "pa\u{00AD}ss"
+    );
+    let service = auth_service(&config_toml);
+    let key = short_term_key("pass").unwrap();
+
+    let request = request_bytes(
+        vec![StunAttribute::new(
+            StunAttributeType::Username,
+            b"dave".to_vec(),
+        )],
         Some(&key),
     );
 
@@ -1053,7 +1453,9 @@ async fn test_duplicate_fingerprint_silently_discarded() {
 }
 
 #[tokio::test]
-async fn test_duplicate_integrity_silently_discarded() {
+async fn test_duplicate_integrity_ignored_after_first() {
+    // RFC 5389 section 15.4: attributes after MESSAGE-INTEGRITY other than
+    // FINGERPRINT MUST be ignored, including a second MESSAGE-INTEGRITY.
     let mut message = StunMessage::new(StunMessageType::Request, [0x65; 12]);
     message.add_attribute(StunAttribute::new(
         StunAttributeType::MessageIntegrity,
@@ -1061,12 +1463,67 @@ async fn test_duplicate_integrity_silently_discarded() {
     ));
     let request = message.encode_with_integrity(b"ignored-key");
 
-    assert!(
-        exchange_with_service(disabled_service(), request)
-            .await
-            .is_none(),
-        "duplicate MESSAGE-INTEGRITY attributes must be discarded silently"
+    let (response, _) = exchange_with_service(disabled_service(), request)
+        .await
+        .expect("a duplicate MESSAGE-INTEGRITY after the first must be ignored");
+
+    assert_eq!(response.message_type, StunMessageType::Response);
+}
+
+#[tokio::test]
+async fn test_duplicate_integrity_authenticates_with_first_digest() {
+    let service = auth_service(SHORT_TERM_CONFIG);
+    let key = short_term_key("s3cret").unwrap();
+    let request = request_bytes(
+        vec![StunAttribute::new(
+            StunAttributeType::Username,
+            b"alice".to_vec(),
+        )],
+        Some(&key),
     );
+
+    let mut decoded = StunMessage::decode(&request).expect("decode");
+    decoded.add_attribute(StunAttribute::new(
+        StunAttributeType::MessageIntegrity,
+        vec![0xAA; 20],
+    ));
+    let request = decoded.encode();
+
+    let (response, bytes) = exchange_with_service(service, request)
+        .await
+        .expect("authentication must use the first MESSAGE-INTEGRITY");
+
+    assert_eq!(response.message_type, StunMessageType::Response);
+    assert!(StunMessage::verify_message_integrity(&bytes, &key));
+}
+
+#[tokio::test]
+async fn test_truncated_duplicate_integrity_ignored_after_first() {
+    // RFC 5389 section 15.4: attributes after MESSAGE-INTEGRITY must be
+    // ignored, even when a duplicate MESSAGE-INTEGRITY has the wrong length.
+    let service = auth_service(SHORT_TERM_CONFIG);
+    let key = short_term_key("s3cret").unwrap();
+    let request = request_bytes(
+        vec![StunAttribute::new(
+            StunAttributeType::Username,
+            b"alice".to_vec(),
+        )],
+        Some(&key),
+    );
+
+    let mut decoded = StunMessage::decode(&request).expect("decode");
+    decoded.add_attribute(StunAttribute::new(
+        StunAttributeType::MessageIntegrity,
+        vec![0xAA; 16],
+    ));
+    let request = decoded.encode();
+
+    let (response, bytes) = exchange_with_service(service, request)
+        .await
+        .expect("a truncated duplicate MESSAGE-INTEGRITY must be ignored");
+
+    assert_eq!(response.message_type, StunMessageType::Response);
+    assert!(StunMessage::verify_message_integrity(&bytes, &key));
 }
 
 #[tokio::test]
@@ -1082,6 +1539,20 @@ async fn test_short_integrity_silently_discarded() {
             .await
             .is_none(),
         "MESSAGE-INTEGRITY shorter than 20 bytes must be discarded silently"
+    );
+}
+
+#[tokio::test]
+async fn test_short_fingerprint_silently_discarded() {
+    let mut message = StunMessage::new(StunMessageType::Request, [0x66; 12]);
+    message.add_attribute(raw_attribute(0x8028, &[0x00, 0x00]));
+    let request = message.encode();
+
+    assert!(
+        exchange_with_service(disabled_service(), request)
+            .await
+            .is_none(),
+        "FINGERPRINT shorter than 4 bytes must be discarded silently"
     );
 }
 
@@ -1127,7 +1598,7 @@ async fn test_valid_fingerprint_with_unknown_required_attribute_gets_420() {
         .await
         .expect("a valid FINGERPRINT must not suppress classification");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(error_status(&response), 420);
 }
 
@@ -1165,7 +1636,11 @@ async fn test_defective_headers_silently_discarded() {
 
 #[tokio::test]
 async fn test_non_request_classes_silently_discarded() {
-    for message_type in [StunMessageType::Response, StunMessageType::ErrorIndication] {
+    for message_type in [
+        StunMessageType::Indication,
+        StunMessageType::Response,
+        StunMessageType::ErrorResponse,
+    ] {
         let bytes = StunMessage::new(message_type, [0x6A; 12]).encode();
         assert!(
             exchange_with_service(disabled_service(), bytes)
@@ -1195,7 +1670,7 @@ async fn test_authentication_failure_wins_over_unknown_attribute() {
         .await
         .expect("enabled authentication must answer with a challenge");
 
-    assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+    assert_eq!(response.message_type, StunMessageType::ErrorResponse);
     assert_eq!(
         error_status(&response),
         401,

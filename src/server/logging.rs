@@ -291,6 +291,15 @@ mod tests {
         }
     }
 
+    /// Serializes tests that install or clear the global FILE_LOGGER.
+    static FILE_LOGGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn file_logger_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        FILE_LOGGER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn test_file_logger_create_and_write() {
         let dir = std::env::temp_dir().join("stunserver_test_logger_create");
@@ -446,6 +455,7 @@ mod tests {
 
     #[test]
     fn test_stun_logger_log_file() {
+        let _serial = file_logger_test_lock();
         let dir = std::env::temp_dir().join("stunserver_test_logger_file_output");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -483,6 +493,7 @@ mod tests {
 
     #[test]
     fn test_stun_logger_log_both() {
+        let _serial = file_logger_test_lock();
         let dir = std::env::temp_dir().join("stunserver_test_logger_both_output");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -582,6 +593,7 @@ mod tests {
 
     #[test]
     fn test_stun_logger_flush_without_file_logger() {
+        let _serial = file_logger_test_lock();
         let logger = StunLogger {
             enable_console: false,
             level_filter: log::LevelFilter::Info,

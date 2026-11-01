@@ -97,20 +97,22 @@ impl MappedAddress {
 
         let address = match family {
             AddressFamily::IPv4 => {
-                if data.len() < 8 {
-                    return Err(StunError::MalformedMessage(
-                        "IPv4 address truncated".to_string(),
-                    ));
+                if data.len() != 8 {
+                    return Err(StunError::MalformedMessage(format!(
+                        "IPv4 MAPPED-ADDRESS must be 8 bytes, got {}",
+                        data.len()
+                    )));
                 }
                 let mut octets = [0u8; 4];
                 octets.copy_from_slice(&data[4..8]);
                 IpAddr::V4(Ipv4Addr::from(octets))
             }
             AddressFamily::IPv6 => {
-                if data.len() < 20 {
-                    return Err(StunError::MalformedMessage(
-                        "IPv6 address truncated".to_string(),
-                    ));
+                if data.len() != 20 {
+                    return Err(StunError::MalformedMessage(format!(
+                        "IPv6 MAPPED-ADDRESS must be 20 bytes, got {}",
+                        data.len()
+                    )));
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&data[4..20]);

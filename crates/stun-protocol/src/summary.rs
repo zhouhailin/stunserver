@@ -82,8 +82,9 @@ pub fn describe_attribute(
 fn message_type_name(message_type: StunMessageType) -> &'static str {
     match message_type {
         StunMessageType::Request => "Binding Request",
+        StunMessageType::Indication => "Binding Indication",
         StunMessageType::Response => "Binding Success Response",
-        StunMessageType::ErrorIndication => "Binding Error Response",
+        StunMessageType::ErrorResponse => "Binding Error Response",
     }
 }
 
@@ -198,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_describe_error_code() {
-        let code = ErrorCode::new(4, 20, "Unknown Attribute".to_string());
+        let code = ErrorCode::new(4, 20, "Unknown Attribute".to_string()).unwrap();
         let attr = StunAttribute::new(StunAttributeType::ErrorCode, code.encode_value());
 
         assert_eq!(
@@ -314,8 +315,8 @@ mod tests {
 
     #[test]
     fn test_describe_error_response_message() {
-        let mut message = StunMessage::new(StunMessageType::ErrorIndication, TXN);
-        let code = ErrorCode::new(4, 20, "Unknown Attribute".to_string());
+        let mut message = StunMessage::new(StunMessageType::ErrorResponse, TXN);
+        let code = ErrorCode::new(4, 20, "Unknown Attribute".to_string()).unwrap();
         message.add_attribute(StunAttribute::new(
             StunAttributeType::ErrorCode,
             code.encode_value(),

@@ -21,9 +21,9 @@ Relationships: one `AuthConfig` owns zero or more `UserCredential` entries; mode
 
 | Field | Type | Validation |
 |-------|------|------------|
-| `username` | string | Non-empty UTF-8, unique within the list |
-| `password` | string | Non-empty; SASLprep-normalized before long-term key derivation |
-| `key` | bytes (computed) | Raw password bytes for short-term; 16-byte MD5 digest for long-term; never serialized or logged |
+| `username` | string | Non-empty UTF-8; SASLprep-prepared; at most 512 bytes; unique after preparation |
+| `password` | string | Non-empty; SASLprep-normalized before either key derivation |
+| `key` | bytes (computed) | `SASLprep(password)` for short-term; 16-byte `MD5(SASLprep(username) ":" SASLprep(realm) ":" SASLprep(password))` digest for long-term; never serialized or logged |
 
 Lifecycle: created when configuration loads; immutable for the server lifetime; dropped on shutdown.
 
@@ -40,7 +40,7 @@ The decoded attributes that participate in authentication.
 | Attribute | Type code | Required for | Handling |
 |-----------|-----------|--------------|----------|
 | USERNAME | `0x0006` | short-term and long-term | Value bytes are compared to the credential username |
-| MESSAGE-INTEGRITY | `0x0008` | both | Exactly 20 bytes; at most one; last authenticated attribute |
+| MESSAGE-INTEGRITY | `0x0008` | both | First occurrence must be exactly 20 bytes; later occurrences are ignored (RFC 5389 §15.4) |
 | REALM | `0x0014` | long-term | Compared to configured realm |
 | NONCE | `0x0015` | long-term | Validated by MAC and lifetime |
 | FINGERPRINT | `0x8028` | optional | Final attribute only; validated before auth |
@@ -70,13 +70,16 @@ Result of the authentication stage for one request.
 
 Decision order (fixed):
 
-1. Short-term missing USERNAME or MESSAGE-INTEGRITY → `Reject 400`.
-2. Short-term unknown username or bad MAC → `Reject 401`.
-3. Long-term missing MESSAGE-INTEGRITY → `Reject 401` with REALM + NONCE.
-4. Long-term MESSAGE-INTEGRITY present but USERNAME, REALM, or NONCE missing → `Reject 400`.
-5. Long-term nonce stale or invalid → `Reject 438` with fresh NONCE + REALM.
-6. Long-term unknown username, realm mismatch, or bad MAC → `Reject 401` with REALM + NONCE.
-7. Otherwise → `Authenticated`.
+1. Short-term USERNAME attribute or MESSAGE-INTEGRITY missing → `Reject 400`.
+2. Short-term USERNAME present but empty, non-UTF-8, or SASLprep-invalid → `Reject 401`.
+3. Short-term USERNAME over 512 bytes, unknown username, or bad MAC → `Reject 400`/`401`.
+4. Long-term missing MESSAGE-INTEGRITY → `Reject 401` with REALM + NONCE.
+5. Long-term MESSAGE-INTEGRITY present but USERNAME, REALM, or NONCE attribute missing → `Reject 400`.
+6. Long-term NONCE present but non-UTF-8, malformed, stale, or invalid → `Reject 438` with fresh NONCE + REALM.
+7. Long-term USERNAME or REALM present but empty, non-UTF-8, or SASLprep-invalid → `Reject 401` with REALM + NONCE.
+8. Long-term USERNAME, REALM, or NONCE over its length limit → `Reject 400`.
+9. Long-term unknown username, realm mismatch, or bad MAC → `Reject 401` with REALM + NONCE.
+10. Otherwise → `Authenticated`.
 
 ### Response shape
 

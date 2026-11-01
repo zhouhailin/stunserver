@@ -46,7 +46,8 @@ struct Args {
     #[arg(default_value = "stun.l.google.com:19302")]
     server: String,
 
-    /// Request timeout in seconds.
+    /// Request timeout in seconds (hard cap; the RFC 5389 retransmission
+    /// schedule can take up to 40 seconds).
     #[arg(short, long, default_value = "5")]
     timeout: u64,
 
@@ -82,6 +83,11 @@ struct Args {
     /// listings; prefer the STUNCLIENT_PASSWORD environment variable.
     #[arg(long)]
     password: Option<String>,
+
+    /// Override the REALM proposed by a long-term challenge (diagnostic use
+    /// only; requires --auth-mode long-term).
+    #[arg(long)]
+    realm: Option<String>,
 }
 
 fn main() {
@@ -202,9 +208,19 @@ fn resolve_auth(args: &Args, env_password: Option<&str>) -> Result<client::Clien
                     "--username/--password require --auth-mode short-term or long-term".to_string(),
                 );
             }
+            if args.realm.is_some() {
+                return Err("--realm requires --auth-mode long-term".to_string());
+            }
             Ok(client::ClientAuth::disabled())
         }
         AuthModeArg::ShortTerm | AuthModeArg::LongTerm => {
+            if args.auth_mode != AuthModeArg::LongTerm && args.realm.is_some() {
+                return Err("--realm requires --auth-mode long-term".to_string());
+            }
+            let realm = match args.realm.as_deref() {
+                Some("") => return Err("--realm must not be empty".to_string()),
+                realm => realm,
+            };
             let username = args
                 .username
                 .as_deref()
@@ -224,7 +240,12 @@ fn resolve_auth(args: &Args, env_password: Option<&str>) -> Result<client::Clien
             let mode = client::AuthMode::from(args.auth_mode);
             Ok(match mode {
                 client::AuthMode::ShortTerm => client::ClientAuth::short_term(username, password),
-                client::AuthMode::LongTerm => client::ClientAuth::long_term(username, password),
+                client::AuthMode::LongTerm => match realm {
+                    Some(realm) => {
+                        client::ClientAuth::long_term_with_realm(username, password, realm)
+                    }
+                    None => client::ClientAuth::long_term(username, password),
+                },
                 client::AuthMode::Disabled => client::ClientAuth::disabled(),
             })
         }
@@ -401,6 +422,65 @@ mod tests {
         assert_eq!(auth.mode(), client::AuthMode::Disabled);
         assert_eq!(auth.username(), None);
         assert_eq!(auth.password(), None);
+    }
+
+    #[test]
+    fn test_realm_flag_parsed() {
+        let args = parse(&["stunclient", "--realm", "example.org"]);
+        assert_eq!(args.realm.as_deref(), Some("example.org"));
+    }
+
+    #[test]
+    fn test_resolve_auth_long_term_with_realm_override() {
+        let args = parse(&[
+            "stunclient",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+            "--realm",
+            "example.org",
+        ]);
+        let auth = resolve_auth(&args, None).unwrap();
+        assert_eq!(auth.mode(), client::AuthMode::LongTerm);
+        assert_eq!(auth.realm(), Some("example.org"));
+    }
+
+    #[test]
+    fn test_resolve_auth_rejects_realm_without_long_term() {
+        let short = parse(&[
+            "stunclient",
+            "--auth-mode",
+            "short-term",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+            "--realm",
+            "example.org",
+        ]);
+        assert!(resolve_auth(&short, None).is_err());
+
+        let disabled = parse(&["stunclient", "--realm", "example.org"]);
+        assert!(resolve_auth(&disabled, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_rejects_empty_realm() {
+        let args = parse(&[
+            "stunclient",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+            "--realm",
+            "",
+        ]);
+        assert!(resolve_auth(&args, None).is_err());
     }
 
     #[test]

@@ -51,7 +51,7 @@ make package
 # 先构建
 make build
 
-# 安装（需要 root 权限）
+# 安装（需要 root 权限；同时安装 /etc/sysctl.d/99-stunserver.conf）
 cd deploy
 sudo make install
 
@@ -61,6 +61,9 @@ sudo make start
 # 查看状态
 sudo make status
 ```
+
+`make install` 还会应用 `systemd/99-stunserver.conf` 中的内核 UDP 缓冲上限；具体参数、
+校验命令与容器场景见 [系统优化](#系统优化)。
 
 ### Docker 部署
 
@@ -88,7 +91,7 @@ docker run -d \
 listen_address = "0.0.0.0"
 port = 3478
 worker_threads = 0  # 0 = 自动检测 CPU 核心数
-max_connections = 10000
+max_connections = 10000  # 最大并发处理请求数；超出时丢弃数据报
 
 [logging]
 level = "info"
@@ -105,6 +108,10 @@ udp_send_buffer_size = 1048576
 tcp_connection_timeout_sec = 30
 tcp_idle_timeout_sec = 300
 ```
+
+`udp_recv_buffer_size` 与 `udp_send_buffer_size` 会在创建 socket 时真正以 `SO_RCVBUF`/`SO_SNDBUF`
+应用。内核会把它们静默截断到 `net.core.rmem_max` 与 `net.core.wmem_max`；推荐的上限、
+持久化方式与 systemd 资源设置见 [系统优化](#系统优化)。
 
 ### 环境变量（Docker）
 
@@ -133,7 +140,9 @@ password = "change-me"
 # nonce_lifetime_sec = 600
 ```
 
-`long-term` 模式下，客户端先收到携带 REALM 与 NONCE 的未签名 401 挑战，再以签名请求重试。NONCE 过期时返回 438 并附带新 NONCE，客户端最多重试两次。`nonce_lifetime_sec` 取值范围为 1 到 86400。
+`long-term` 模式下，客户端先收到携带 REALM 与 NONCE 的未签名 401 挑战，再以签名请求重试。NONCE 过期时返回 438 并附带新 NONCE，客户端会采用它，最多进行两次带签名的重试；签名请求之后再收到 401 则直接终止（RFC 5389 §10.2.3 禁止在未更换凭据的情况下重试）。`nonce_lifetime_sec` 取值范围为 1 到 86400。
+
+USERNAME、REALM 和密码均按 SASLprep 处理（RFC 5389 §15.3、§15.4、§15.7）；USERNAME 最长 512 字节，REALM/NONCE 少于 128 个字符。自带 UDP 客户端按 §7.2.1 重传请求：初始 RTO 为 500 ms，每次翻倍，最多发送 7 次；最后一次发送后再等待 16×RTO（8 秒）；`--timeout` 是整笔交换的硬上限。来源地址不符、事务 ID 不一致或校验失败的响应会被静默丢弃，客户端继续等待有效响应（§7.3.3、§10.1.3）。400 错误允许不带 MESSAGE-INTEGRITY，因为服务器可能无法为其计算有效摘要（§15.6）。`stunclient` 每次调用只执行一次探测交换，因此不涉及跨请求缓存 REALM/NONCE（§10.2.1.2）或按服务器缓存 RTO（§7.2.1）。
 
 配置文件以明文保存密码，请仅允许服务账号读取：
 
@@ -147,7 +156,50 @@ chmod 600 /opt/stunserver/etc/stunserver.conf
 STUNCLIENT_PASSWORD='change-me' stunclient --auth-mode long-term --username alice stun.example.org:3478
 ```
 
+`--realm` 可用于诊断时覆盖 long-term 挑战下发的 REALM（挑战中的 NONCE 仍会使用）。真实服务端始终按自己配置的 REALM 派生密钥，因此覆盖值与服务端不一致时通常返回 401。
+
 MESSAGE-INTEGRITY 只保证完整性，UDP 流量不会被加密。
+
+## 系统优化
+
+在高包速率下，除了 `[network]` 配置外还需要内核侧的余量。推荐值随
+`systemd/99-stunserver.conf` 提供，并由 `deploy/Makefile` 安装到
+`/etc/sysctl.d/99-stunserver.conf`：
+
+| 参数 | 值 | 作用 |
+|------|----|------|
+| `net.core.rmem_max` | `16777216` | `SO_RCVBUF` 的上限；不提高时，配置的 `udp_recv_buffer_size` 会被静默截断（常见为 212992 字节，在几万 QPS 下只有几毫秒的缓冲）。 |
+| `net.core.wmem_max` | `16777216` | `SO_SNDBUF` 的上限；同样限制 `udp_send_buffer_size`。 |
+| `net.core.netdev_max_backlog` | `16384` | 网卡驱动到协议栈之间的队列；若 `/proc/net/softnet_stat` 的 dropped 列持续增长，应提高该值。 |
+
+应用并确认：
+
+```bash
+sudo cp systemd/99-stunserver.conf /etc/sysctl.d/99-stunserver.conf
+sudo sysctl --system
+sysctl net.core.rmem_max net.core.wmem_max net.core.netdev_max_backlog
+```
+
+内核在内部通常按请求值的 2 倍记账，因此 4 MiB 的请求实际受限于
+`2 × net.core.rmem_max` / `2 × net.core.wmem_max`。在容器中运行服务时，这些上限来自宿主机
+内核；请直接在宿主机上设置（除非容器使用独立的网络命名空间）。`stunbench` 为其自身的
+UDP socket 请求 4 MiB 缓冲，同样受上述内核上限约束。
+
+systemd 单元（`systemd/stunserver.service`）额外设置了 `LimitNOFILE=1048576`，日志写入
+journal。内核参数是全局的，修改 sysctl drop-in 或 `[network]` 缓冲大小后需要重启服务，
+以便用新参数重新创建监听 socket：
+
+```bash
+sudo systemctl restart stunserver
+```
+
+删除 `/etc/sysctl.d/99-stunserver.conf` 后，后续启动不再提高上限，但当前已生效的值会保留到
+重启。
+
+### 示例：50000 QPS 压测
+
+应用上述参数并将 `udp_recv_buffer_size`/`udp_send_buffer_size` 设为 1048576 后，
+`stunbench --qps 50000` 在回环测试中完成 3,000,000 次请求、0 失败，p99 = 0.92 ms。
 
 ## 目录结构
 
@@ -316,9 +368,9 @@ stunserver/
 │   └── bench/          # 性能测试工具
 ├── crates/
 │   └── stun-protocol/  # 协议实现
-├── deploy/             # 部署脚本
+├── deploy/             # 部署脚本（systemd 安装器、配置示例）
 ├── docker/             # Docker 文件
-├── systemd/            # Systemd 服务文件
+├── systemd/            # Systemd 服务单元与内核调优 drop-in
 └── .github/workflows/  # CI/CD 工作流
 ```
 

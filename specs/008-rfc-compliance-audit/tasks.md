@@ -102,7 +102,7 @@
 ### Tests for User Story 3 (write first, observe failure)
 
 - [X] T019 [P] [US3] Add failing protocol authentication tests in `crates/stun-protocol/tests/authentication.rs`: short-term HMAC verification, long-term key derivation with ASCII and non-ASCII SASLprep passwords, tampered byte rejection, and exclusion of attributes after MESSAGE-INTEGRITY from the digest range (SC-012).
-- [X] T020 [P] [US3] Add failing `[auth]` configuration tests in `src/server/config.rs`: an absent section defaults to disabled; unknown mode is rejected; enabled modes require at least one user; usernames are non-empty and unique; passwords are non-empty; long-term requires a non-empty realm; `nonce_lifetime_sec` must be 1-86400 in long-term mode; short-term keys are raw password bytes and long-term keys are 16-byte MD5 digests.
+- [X] T020 [P] [US3] Add failing `[auth]` configuration tests in `src/server/config.rs`: an absent section defaults to disabled; unknown mode is rejected; enabled modes require at least one user; usernames are non-empty and unique; passwords are non-empty; long-term requires a non-empty realm; `nonce_lifetime_sec` must be 1-86400 in long-term mode; short-term keys are SASLprep(password) and long-term keys are 16-byte MD5 digests.
 - [X] T021 [P] [US3] Add failing server authentication tests in `src/server/tests/integration.rs` covering all 11 US3 scenarios: short-term success signed with no USERNAME; short-term missing attributes 400 unsigned; short-term unknown user or bad MAC 401 unsigned; long-term missing MESSAGE-INTEGRITY 401 with REALM+NONCE; long-term MESSAGE-INTEGRITY present but USERNAME/REALM/NONCE missing 400; stale NONCE 438 with fresh NONCE+REALM; long-term unknown user, realm mismatch, or bad MAC 401 with REALM+NONCE; long-term success signed with no USERNAME/REALM/NONCE; authenticated 420 signed; enabled mode with no credential attributes never succeeds; failure responses omit MESSAGE-INTEGRITY and USERNAME. Add an end-to-end non-ASCII SASLprep case: configure a credential whose password requires normalization and authenticate over the wire with a client password whose normalized form matches it (SC-009, SC-012).
 - [X] T022 [P] [US3] Add failing secret-leak tests in `src/server/tests/logging_levels.rs` asserting passwords, derived keys, and the nonce secret never appear in DEBUG/TRACE output and that MESSAGE-INTEGRITY is summarized by length only (FR-033, SC-010).
 
@@ -329,3 +329,11 @@ After Foundational:
 ## Phase 12: Convergence
 
 - [X] T063 Give the remaining umbrella `out-of-scope` row in `docs/rfc-conformance.md` (the TCP/TLS transport row, currently `| — | — | — | TCP/TLS transport for STUN | out-of-scope | ...`) an explicit RFC, section, and MUST/SHOULD/MAY level — e.g. `| 5389 | §9 | MAY |` — so every ConformanceRow carries the normative metadata the plan's schema requires and the document's own Review Checklist asserts per T015 / plan: ConformanceRow schema (partial)
+
+## Phase 13: Post-audit conformance fixes
+
+- [X] T064 Apply SASLprep to USERNAME and REALM in `integrity::long_term_key`, server config precomputation, server request authentication, and client request building; prepare usernames before keying the user table and reject duplicate-after-preparation entries (RFC 5389 §15.3, §15.7).
+- [X] T065 Accept an unsigned 400 response in the client while keeping MESSAGE-INTEGRITY mandatory for other authenticated non-challenge errors (RFC 5389 §15.6).
+- [X] T066 Add RFC 5389 §7.2.1 UDP retransmission to the client: 500 ms initial RTO, doubling, at most seven transmissions, bounded by `--timeout`.
+- [X] T067 Silently discard client-side responses from another source, with a mismatched transaction ID, undecodable, or failing integrity/fingerprint/attribute validation, and keep waiting instead of aborting the exchange (RFC 5389 §7.3.3, §10.1.3).
+- [X] T068 Reject datagrams whose header length does not delimit the whole datagram, and enforce USERNAME at most 512 bytes and REALM/NONCE fewer than 128 characters in config, server, and client (RFC 5389 §6, §15.3, §15.7, §15.8).

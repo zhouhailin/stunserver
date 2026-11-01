@@ -19,6 +19,9 @@ rustc-ice-*.txt
 # Log files
 *.log
 
+# Runtime log directory created by the server
+/log/
+
 # Cargo.lock for library crates (comment out if this is a binary-only project)
 # Cargo.lock
 

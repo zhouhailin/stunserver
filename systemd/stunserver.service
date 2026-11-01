@@ -23,7 +23,12 @@ ReadWritePaths=/opt/stunserver/log
 PrivateTmp=true
 
 # Resource limits
-LimitNOFILE=65536
+LimitNOFILE=1048576
+
+# Kernel UDP buffer limits are applied through
+# /etc/sysctl.d/99-stunserver.conf (installed by deploy/Makefile). Restart the
+# service after changing them so the listening socket is recreated with the
+# new [network] buffer sizes.
 
 [Install]
 WantedBy=multi-user.target

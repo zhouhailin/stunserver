@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `stunbench --realm <REALM>` for long-term credentials, mirroring `stunclient`:
+  overrides the REALM in the request and key derivation while still using the
+  server NONCE, and survives a 438 Stale Nonce refresh.
+- `stunbench` refreshes the NONCE automatically on 438 Stale Nonce responses in
+  long-term authentication mode.
+- `systemd/99-stunserver.conf` with the recommended kernel parameters
+  (`net.core.rmem_max`, `net.core.wmem_max`, `net.core.netdev_max_backlog`);
+  `deploy/Makefile install` installs it to `/etc/sysctl.d/`.
+- `stunbench` prints a final progress line when a run completes, so a 60-second
+  run ends with an `[01:00]` report matching the final summary.
+
+### Changed
+
+- `systemd/stunserver.service` raises `LimitNOFILE` to 1048576 and documents
+  the sysctl drop-in and restart requirement.
+- English and Chinese READMEs gain a "System Tuning" section covering kernel
+  limits, persistence, container notes, and systemd resource settings.
+
+### Fixed
+
+- The server and `stunbench` now apply `udp_recv_buffer_size` /
+  `udp_send_buffer_size` as `SO_RCVBUF` / `SO_SNDBUF` on their UDP sockets;
+  previously the configured values were never set on the socket.
+- `stunbench` preallocates latency storage for duration runs and polls its
+  progress-task stop flag every second, removing stalls and shutdown delays.
+
 ## [2.0.0] - 2026-10-29
 
 ### Added

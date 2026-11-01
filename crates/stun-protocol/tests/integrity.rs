@@ -93,9 +93,47 @@ fn test_long_term_key_uses_saslprep_for_non_ascii() {
 }
 
 #[test]
-fn test_short_term_key_is_raw_password_bytes() {
-    assert_eq!(short_term_key("s3cret"), b"s3cret".to_vec());
-    assert_eq!(short_term_key(""), Vec::<u8>::new());
+fn test_long_term_key_strips_username_realm_quotes_and_trailing_nulls() {
+    // RFC 5389 section 15.4: USERNAME and REALM lose any quotes and trailing
+    // nulls before being hashed.
+    let plain = long_term_key("user", "realm", "pass").expect("derive key");
+
+    let quoted = long_term_key("\"user\"", "\"realm\"", "pass").expect("derive key");
+    assert_eq!(quoted, plain);
+
+    let null_terminated = long_term_key("user\0\0", "realm\0", "pass").expect("derive key");
+    assert_eq!(null_terminated, plain);
+}
+
+#[test]
+fn test_long_term_key_password_only_strips_trailing_nulls() {
+    // RFC 5389 section 15.4 removes trailing nulls from the password but
+    // leaves quotes intact.
+    let plain = long_term_key("user", "realm", "pass").expect("derive key");
+
+    let null_terminated = long_term_key("user", "realm", "pass\0").expect("derive key");
+    assert_eq!(null_terminated, plain);
+
+    let quoted = long_term_key("user", "realm", "\"pass\"").expect("derive key");
+    assert_ne!(quoted, plain);
+}
+
+#[test]
+fn test_short_term_key_uses_saslprep() {
+    // ASCII passwords are unchanged by SASLprep.
+    assert_eq!(short_term_key("s3cret").unwrap(), b"s3cret".to_vec());
+    assert_eq!(short_term_key("").unwrap(), Vec::<u8>::new());
+
+    // Characters SASLprep removes must not change the key.
+    assert_eq!(short_term_key("pa\u{00AD}ss").unwrap(), b"pass".to_vec());
+
+    // NFKC normalization makes composed and decomposed spellings equivalent.
+    let composed = short_term_key("p\u{00E4}ssword").unwrap();
+    let decomposed = short_term_key("pa\u{0308}ssword").unwrap();
+    assert_eq!(composed, decomposed);
+
+    // SASLprep failures are surfaced rather than silently used raw.
+    assert!(short_term_key("bad\u{0007}").is_err());
 }
 
 #[test]

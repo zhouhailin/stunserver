@@ -14,7 +14,7 @@ All decisions below resolve the Technical Context; no `NEEDS CLARIFICATION` item
 
 ## D2 — SASLprep implementation
 
-**Decision**: Use the `stringprep 0.1` crate's SASLprep profile (RFC 4013, Unicode 3.2) for long-term passwords.
+**Decision**: Use the `stringprep 0.1` crate's SASLprep profile (RFC 4013, Unicode 3.2) for USERNAME, REALM, and passwords (RFC 5389 §15.3, §15.4, §15.7).
 
 **Rationale**: The clarified requirement is full SASLprep: mapping, normalization, prohibited-output, and bidi checks. Implementing the Unicode 3.2 tables by hand is error-prone and large. The `stringprep` crate exposes the SASLprep profile and keeps the implementation auditable.
 
@@ -32,7 +32,7 @@ All decisions below resolve the Technical Context; no `NEEDS CLARIFICATION` item
 
 ## D4 — Credential storage and configuration model
 
-**Decision**: Add an `[auth]` TOML section with `mode` (`disabled` default, `short-term`, `long-term`), `realm`, `nonce_lifetime_sec` (default 600), and an array of `[[auth.users]]` entries with `username` and `password`. Precompute each user's key once at startup: the raw password for short-term, MD5(SASLprep(password)) over the credential triple for long-term.
+**Decision**: Add an `[auth]` TOML section with `mode` (`disabled` default, `short-term`, `long-term`), `realm`, `nonce_lifetime_sec` (default 600), and an array of `[[auth.users]]` entries with `username` and `password`. Precompute each user's key once at startup: SASLprep(password) for short-term, MD5(SASLprep(username) ":" SASLprep(realm) ":" SASLprep(password)) for long-term. Prepare usernames before storage so the lookup table is keyed by the normalized form; reject usernames over 512 bytes, realms over 127 characters, and collisions that appear only after preparation.
 
 **Rationale**: One credential list serves both mechanisms; the mode selects how the key is derived and which error flows apply. Storing passwords rather than derived keys keeps configuration understandable and lets the same file switch modes. Precomputing keys removes MD5/SASLprep from the request path.
 
@@ -74,7 +74,7 @@ All decisions below resolve the Technical Context; no `NEEDS CLARIFICATION` item
 
 ## D9 — Client authentication state machine
 
-**Decision**: Add explicit `--auth-mode` (`disabled` default, `short-term`, `long-term`), `--username`, and `--password`. Short-term signs the first request. Long-term sends an unauthenticated first request, consumes REALM/NONCE from 401 or 438, retries at most twice, and validates MESSAGE-INTEGRITY on the response. Without credentials, 401/438 becomes a structured `ServerError` with no retry.
+**Decision**: Add explicit `--auth-mode` (`disabled` default, `short-term`, `long-term`), `--username`, and `--password`. Short-term signs the first request. Long-term sends an unauthenticated first request, consumes REALM/NONCE from 401 or 438, retries at most twice while responding to 438 with the fresh NONCE, and validates MESSAGE-INTEGRITY on the response. A 401 after a signed request is terminal because §10.2.3 forbids retrying without changing credentials. Without credentials, 401/438 becomes a structured `ServerError` with no retry. Every request uses §7.2.1 UDP retransmission (500 ms initial RTO, doubling, at most seven transmissions, then an Rm × RTO final wait; `--timeout` is a hard cap), and responses from another source, with a mismatched transaction ID, or failing validation are silently discarded (§7.3.3, §10.1.3). A 400 response is accepted without MESSAGE-INTEGRITY (§15.6).
 
 **Rationale**: The clarification selected full client authentication. An explicit mode mirrors the server and avoids guessing from attribute presence. The retry bound prevents loops against a misconfigured server.
 

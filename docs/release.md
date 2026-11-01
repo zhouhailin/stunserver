@@ -124,6 +124,15 @@ GitHub automatically generates source archives:
 - `Source code (tar.gz)`
 - `Source code (zip)`
 
+### Deployment Package (`make package`)
+
+`make package` assembles `dist/` from the release build:
+
+- `stunserver-bin/stunserver` — server binary
+- `stunserver-etc/stunserver.conf` — example configuration (from `deploy/stunserver.conf.example`)
+- `stunserver.service` — systemd unit (from `systemd/`)
+- `99-stunserver.conf` — kernel tuning drop-in for `/etc/sysctl.d/`
+
 ## Hotfix Releases
 
 For critical bugs:
@@ -171,6 +180,8 @@ Before creating a release tag:
 - [ ] Version numbers updated in all Cargo.toml files
 - [ ] CHANGELOG updated (if maintained)
 - [ ] Documentation updated
+- [ ] Deployment assets updated (`deploy/Makefile`, `systemd/stunserver.service`, `systemd/99-stunserver.conf`)
+- [ ] `systemd-analyze verify systemd/stunserver.service` passes (missing-binary warning is expected before installation)
 - [ ] No uncommitted changes
 
 ## Troubleshooting

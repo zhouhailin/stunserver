@@ -8,22 +8,25 @@ use byteorder::{BigEndian, ByteOrder};
 /// Decoded ERROR-CODE attribute value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorCode {
-    /// Error class (3 bits on the wire, values 0-7).
+    /// Error class (3 bits on the wire, values 3-6).
     pub class: u8,
-    /// Error number (8 bits).
+    /// Error number (8 bits, values 0-99).
     pub number: u8,
-    /// Human-readable reason phrase (UTF-8).
+    /// Human-readable reason phrase (UTF-8, under 128 characters).
     pub reason: String,
 }
 
 impl ErrorCode {
-    /// Create an error code, masking the class to three bits.
-    pub fn new(class: u8, number: u8, reason: String) -> Self {
-        Self {
-            class: class & 0x07,
+    /// Create an error code, enforcing the RFC 5389 section 15.6 limits:
+    /// class 3-6, number 0-99, and a UTF-8 reason phrase under 128 characters.
+    pub fn new(class: u8, number: u8, reason: String) -> Result<Self, StunError> {
+        validate_code(class, number)?;
+        validate_reason(&reason)?;
+        Ok(Self {
+            class,
             number,
             reason,
-        }
+        })
     }
 
     /// Combined three-digit status code (for example 420).
@@ -47,12 +50,49 @@ impl ErrorCode {
                 "ERROR-CODE value too short".to_string(),
             ));
         }
+        let class = data[2] & 0x07;
+        let number = data[3];
+        validate_code(class, number)?;
+
+        let reason = std::str::from_utf8(&data[4..])
+            .map_err(|_| {
+                StunError::MalformedMessage(
+                    "ERROR-CODE reason phrase is not valid UTF-8".to_string(),
+                )
+            })?
+            .to_string();
+        validate_reason(&reason)?;
+
         Ok(Self {
-            class: data[2] & 0x07,
-            number: data[3],
-            reason: String::from_utf8_lossy(&data[4..]).into_owned(),
+            class,
+            number,
+            reason,
         })
     }
+}
+
+fn validate_code(class: u8, number: u8) -> Result<(), StunError> {
+    if !(3..=6).contains(&class) {
+        return Err(StunError::MalformedMessage(format!(
+            "ERROR-CODE class must be 3-6, got {class}"
+        )));
+    }
+    if number > 99 {
+        return Err(StunError::MalformedMessage(format!(
+            "ERROR-CODE number must be 0-99, got {number}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_reason(reason: &str) -> Result<(), StunError> {
+    let characters = reason.chars().count();
+    if characters >= 128 {
+        return Err(StunError::MalformedMessage(format!(
+            "ERROR-CODE reason phrase must be under 128 characters, got {characters}"
+        )));
+    }
+    Ok(())
 }
 
 /// Decoded UNKNOWN-ATTRIBUTES attribute value.
@@ -108,7 +148,13 @@ mod tests {
 
     #[test]
     fn test_error_code_status_code() {
-        assert_eq!(ErrorCode::new(4, 20, String::new()).status_code(), 420);
-        assert_eq!(ErrorCode::new(5, 0, String::new()).status_code(), 500);
+        assert_eq!(
+            ErrorCode::new(4, 20, String::new()).unwrap().status_code(),
+            420
+        );
+        assert_eq!(
+            ErrorCode::new(5, 0, String::new()).unwrap().status_code(),
+            500
+        );
     }
 }

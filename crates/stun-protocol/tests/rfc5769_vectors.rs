@@ -245,7 +245,7 @@ fn test_rfc5769_message_type_validation() {
     // Valid message types
     assert_eq!(StunMessageType::Request.to_raw(), 0x0001);
     assert_eq!(StunMessageType::Response.to_raw(), 0x0101);
-    assert_eq!(StunMessageType::ErrorIndication.to_raw(), 0x0111);
+    assert_eq!(StunMessageType::ErrorResponse.to_raw(), 0x0111);
 
     // Invalid message type
     let result = StunMessageType::from_raw(0x9999);
@@ -385,7 +385,7 @@ fn test_rfc5769_address_family_encoding() {
 fn test_rfc5769_short_term_integrity_and_fingerprint() {
     use stun_protocol::integrity::short_term_key;
 
-    let key = short_term_key("VOkJxbRl1RmTxUk/WvJxBt");
+    let key = short_term_key("VOkJxbRl1RmTxUk/WvJxBt").unwrap();
     for (name, vector) in [
         ("2.1 request", &SAMPLE_REQUEST[..]),
         ("2.2 IPv4 response", &SAMPLE_IPV4_RESPONSE[..]),
@@ -409,7 +409,7 @@ fn test_rfc5769_short_term_integrity_and_fingerprint() {
 fn test_rfc5769_tampering_is_detected() {
     use stun_protocol::integrity::short_term_key;
 
-    let key = short_term_key("VOkJxbRl1RmTxUk/WvJxBt");
+    let key = short_term_key("VOkJxbRl1RmTxUk/WvJxBt").unwrap();
 
     // Byte 44 is inside XOR-MAPPED-ADDRESS, covered by both attributes.
     let mut covered = SAMPLE_IPV4_RESPONSE;

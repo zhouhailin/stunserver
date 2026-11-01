@@ -28,6 +28,7 @@ package: build
 	@cp target/release/stunserver dist/stunserver-bin/
 	@cp deploy/stunserver.conf.example dist/stunserver-etc/stunserver.conf
 	@cp systemd/stunserver.service dist/
+	@cp systemd/99-stunserver.conf dist/
 	@echo "Package created in dist/"
 	@echo "Contents:"
 	@ls -la dist/

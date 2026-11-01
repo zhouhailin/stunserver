@@ -107,8 +107,8 @@ fn main() {
     // Create server state.
     let state = Arc::new(server::ServerState::with_auth(auth));
 
-    // Build and run the Tokio runtime.
-    let runtime = match tokio::runtime::Runtime::new() {
+    // Build and run the Tokio runtime with the configured worker count.
+    let runtime = match build_runtime(cfg.server.worker_threads) {
         Ok(rt) => rt,
         Err(e) => {
             log::error!("Failed to create Tokio runtime: {}", e);
@@ -116,7 +116,7 @@ fn main() {
         }
     };
 
-    let result = runtime.block_on(server::run_server(&cfg.server, state));
+    let result = runtime.block_on(server::run_server(&cfg.server, &cfg.network, state));
 
     match result {
         Ok(()) => {
@@ -136,6 +136,16 @@ fn main() {
             process::exit(3);
         }
     }
+}
+
+/// Build a multi-threaded Tokio runtime using the configured worker count.
+/// A configured value of 0 means "use the Tokio default".
+fn build_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if worker_threads > 0 {
+        builder.worker_threads(worker_threads);
+    }
+    builder.enable_all().build()
 }
 
 /// Resolve the effective log level: CLI flags override the configured level.
@@ -188,5 +198,17 @@ mod tests {
         assert!(help.contains("--debug"));
         assert!(help.contains("--trace"));
         assert!(help.contains("prints raw packet bytes"));
+    }
+
+    #[test]
+    fn test_build_runtime_uses_configured_worker_threads() {
+        let runtime = build_runtime(2).expect("runtime builds");
+        assert_eq!(runtime.metrics().num_workers(), 2);
+    }
+
+    #[test]
+    fn test_build_runtime_zero_uses_default_worker_count() {
+        let runtime = build_runtime(0).expect("runtime builds");
+        assert!(runtime.metrics().num_workers() > 0);
     }
 }

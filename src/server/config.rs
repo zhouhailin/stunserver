@@ -139,7 +139,8 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Construct a SocketAddr from listen_address and port.
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
-        format!("{}:{}", self.listen_address, self.port).parse()
+        let ip = self.listen_address.parse()?;
+        Ok(SocketAddr::new(ip, self.port))
     }
 }
 
@@ -284,7 +285,7 @@ pub enum AuthMode {
     /// Public Binding server; authentication attributes are ignored.
     #[default]
     Disabled,
-    /// Short-term credentials keyed by raw password bytes.
+    /// Short-term credentials keyed by `SASLprep(password)`.
     ShortTerm,
     /// Long-term credentials with REALM/NONCE challenge and MD5-derived keys.
     LongTerm,
@@ -372,9 +373,16 @@ impl AuthConfig {
         Ok(())
     }
 
+    /// Maximum USERNAME length in bytes (RFC 5389 section 15.3).
+    pub const MAX_USERNAME_BYTES: usize = 512;
+    /// Maximum REALM and NONCE length in characters (RFC 5389 sections 15.7
+    /// and 15.8).
+    pub const MAX_REALM_CHARS: usize = 127;
+
     /// Validate the section and precompute the MESSAGE-INTEGRITY key for every
-    /// configured user. Long-term keys are `MD5(username ":" realm ":" SASLprep(password))`;
-    /// short-term keys are the raw password bytes.
+    /// configured user. Long-term keys are
+    /// `MD5(SASLprep(username) ":" SASLprep(realm) ":" SASLprep(password))`;
+    /// short-term keys are `SASLprep(password)` (RFC 5389 sections 15.3–15.7).
     pub fn precompute_keys(&self) -> Result<AuthTable, ConfigError> {
         self.validate()?;
 
@@ -387,19 +395,46 @@ impl AuthConfig {
             });
         }
 
-        let realm = self.realm.clone().unwrap_or_default();
+        let realm = match self.mode {
+            AuthMode::LongTerm => {
+                let raw = self.realm.as_deref().unwrap_or_default();
+                let prepared = stun_protocol::integrity::saslprep(raw)
+                    .map_err(|_| ConfigError::AuthRealmPreparation)?;
+                if prepared.is_empty() {
+                    return Err(ConfigError::AuthMissingRealm);
+                }
+                if prepared.chars().count() > Self::MAX_REALM_CHARS {
+                    return Err(ConfigError::AuthRealmTooLong);
+                }
+                prepared
+            }
+            _ => String::new(),
+        };
+
         let mut users = HashMap::with_capacity(self.users.len());
         for user in &self.users {
+            let username = stun_protocol::integrity::saslprep(&user.username)
+                .map_err(|_| ConfigError::AuthUsernamePreparation(user.username.clone()))?;
+            if username.is_empty() {
+                return Err(ConfigError::AuthEmptyUsername);
+            }
+            if username.len() > Self::MAX_USERNAME_BYTES {
+                return Err(ConfigError::AuthUsernameTooLong(user.username.clone()));
+            }
+            if users.contains_key(&username) {
+                return Err(ConfigError::AuthDuplicateUsername(user.username.clone()));
+            }
             let key = match self.mode {
-                AuthMode::ShortTerm => user.password.as_bytes().to_vec(),
+                AuthMode::ShortTerm => stun_protocol::integrity::short_term_key(&user.password)
+                    .map_err(|_| ConfigError::AuthKeyDerivation(user.username.clone()))?,
                 AuthMode::LongTerm => {
-                    stun_protocol::integrity::long_term_key(&user.username, &realm, &user.password)
+                    stun_protocol::integrity::long_term_key(&username, &realm, &user.password)
                         .map_err(|_| ConfigError::AuthKeyDerivation(user.username.clone()))?
                         .to_vec()
                 }
                 AuthMode::Disabled => unreachable!("handled above"),
             };
-            users.insert(user.username.clone(), key);
+            users.insert(username, key);
         }
 
         Ok(AuthTable {
@@ -507,8 +542,20 @@ pub enum ConfigError {
     #[error("Authentication user '{0}' has an empty password")]
     AuthEmptyPassword(String),
 
+    #[error("Authentication user '{0}' exceeds the 512-byte USERNAME limit")]
+    AuthUsernameTooLong(String),
+
+    #[error("Failed to prepare the username for user '{0}' with SASLprep")]
+    AuthUsernamePreparation(String),
+
     #[error("Long-term authentication requires a non-empty realm")]
     AuthMissingRealm,
+
+    #[error("Authentication realm exceeds the 127-character REALM limit")]
+    AuthRealmTooLong,
+
+    #[error("Failed to prepare the authentication realm with SASLprep")]
+    AuthRealmPreparation,
 
     #[error("Invalid nonce lifetime: {0}. Must be in range 1-86400 seconds")]
     InvalidNonceLifetime(u64),
@@ -698,6 +745,18 @@ enable_tls = false
         };
         let addr = config.socket_addr().unwrap();
         assert_eq!(addr, "192.168.1.1:8080".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_server_config_socket_addr_ipv6_literal() {
+        let config = ServerConfig {
+            listen_address: "::1".to_string(),
+            port: 3478,
+            worker_threads: 0,
+            max_connections: 10000,
+        };
+        let addr = config.socket_addr().unwrap();
+        assert_eq!(addr, "[::1]:3478".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
@@ -1037,6 +1096,48 @@ password = "two"
     }
 
     #[test]
+    fn test_auth_rejects_duplicate_username_after_saslprep() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "alice"
+password = "one"
+
+[[auth.users]]
+username = "ali\u00ADce"
+password = "two"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.auth.precompute_keys().unwrap_err(),
+            ConfigError::AuthDuplicateUsername(_)
+        ));
+    }
+
+    #[test]
+    fn test_auth_rejects_username_empty_after_saslprep() {
+        let config: Config = toml::from_str(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "\u00AD"
+password = "s3cret"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.auth.precompute_keys().unwrap_err(),
+            ConfigError::AuthEmptyUsername
+        ));
+    }
+
+    #[test]
     fn test_auth_rejects_empty_password() {
         let config: Config = toml::from_str(
             r#"
@@ -1130,20 +1231,100 @@ password = "s3cret"
     }
 
     #[test]
-    fn test_auth_short_term_key_is_raw_password() {
-        let config: Config = toml::from_str(
+    fn test_auth_short_term_username_uses_saslprep() {
+        // RFC 5389 section 15.3: USERNAME is SASLprep'd, so a soft hyphen is
+        // removed before the key lookup.
+        let config_text = format!(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "{}"
+password = "s3cret"
+"#,
+            "ali\u{00AD}ce"
+        );
+        let config: Config = toml::from_str(&config_text).unwrap();
+        let table = config.auth.precompute_keys().unwrap();
+
+        assert_eq!(table.key_for("alice"), Some(&b"s3cret"[..]));
+        assert_eq!(table.key_for("ali\u{00AD}ce"), None);
+    }
+
+    #[test]
+    fn test_auth_long_term_realm_uses_saslprep() {
+        let config_text = format!(
+            r#"
+[auth]
+mode = "long-term"
+realm = "{}"
+
+[[auth.users]]
+username = "alice"
+password = "s3cret"
+"#,
+            "exa\u{0308}mple.org"
+        );
+        let config: Config = toml::from_str(&config_text).unwrap();
+        let table = config.auth.precompute_keys().unwrap();
+
+        assert_eq!(table.realm(), "exämple.org");
+        let expected =
+            stun_protocol::integrity::long_term_key("alice", "exämple.org", "s3cret").unwrap();
+        assert_eq!(table.key_for("alice"), Some(&expected[..]));
+    }
+
+    #[test]
+    fn test_auth_rejects_oversized_username_and_realm() {
+        // RFC 5389 sections 15.3 and 15.7 bound USERNAME and REALM lengths.
+        let long_username = "u".repeat(513);
+        let config_text = format!(
+            r#"
+[auth]
+mode = "short-term"
+
+[[auth.users]]
+username = "{long_username}"
+password = "s3cret"
+"#
+        );
+        let config: Config = toml::from_str(&config_text).unwrap();
+        assert!(config.auth.precompute_keys().is_err());
+
+        let long_realm = "r".repeat(128);
+        let config_text = format!(
+            r#"
+[auth]
+mode = "long-term"
+realm = "{long_realm}"
+
+[[auth.users]]
+username = "alice"
+password = "s3cret"
+"#
+        );
+        let config: Config = toml::from_str(&config_text).unwrap();
+        assert!(config.auth.precompute_keys().is_err());
+    }
+
+    #[test]
+    fn test_auth_short_term_key_uses_saslprep() {
+        // A soft hyphen is removed by SASLprep, so the key is "pass".
+        let config_text = format!(
             r#"
 [auth]
 mode = "short-term"
 
 [[auth.users]]
 username = "alice"
-password = "s3cret"
+password = "{}"
 "#,
-        )
-        .unwrap();
+            "pa\u{00AD}ss"
+        );
+        let config: Config = toml::from_str(&config_text).unwrap();
         let table = config.auth.precompute_keys().unwrap();
-        assert_eq!(table.key_for("alice"), Some(&b"s3cret"[..]));
+        assert_eq!(table.key_for("alice"), Some(&b"pass"[..]));
         assert_eq!(table.key_for("bob"), None);
     }
 

@@ -5,12 +5,17 @@ use stun_protocol::*;
 #[test]
 fn test_message_type_conversion() {
     assert_eq!(StunMessageType::Request.to_raw(), 0x0001);
+    assert_eq!(StunMessageType::Indication.to_raw(), 0x0011);
     assert_eq!(StunMessageType::Response.to_raw(), 0x0101);
-    assert_eq!(StunMessageType::ErrorIndication.to_raw(), 0x0111);
+    assert_eq!(StunMessageType::ErrorResponse.to_raw(), 0x0111);
 
     assert_eq!(
         StunMessageType::from_raw(0x0001).unwrap(),
         StunMessageType::Request
+    );
+    assert_eq!(
+        StunMessageType::from_raw(0x0011).unwrap(),
+        StunMessageType::Indication
     );
     assert_eq!(
         StunMessageType::from_raw(0x0101).unwrap(),
@@ -18,7 +23,7 @@ fn test_message_type_conversion() {
     );
     assert_eq!(
         StunMessageType::from_raw(0x0111).unwrap(),
-        StunMessageType::ErrorIndication
+        StunMessageType::ErrorResponse
     );
 
     assert!(StunMessageType::from_raw(0x9999).is_err());
@@ -91,6 +96,21 @@ fn test_invalid_magic_cookie() {
     data[7] = 0xFF;
 
     let result = StunMessage::decode(&data);
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        StunError::MalformedMessage(_)
+    ));
+}
+
+#[test]
+fn test_trailing_bytes_rejected() {
+    // RFC 5389 section 6: the message length delimits the message, so a
+    // datagram carrying bytes after that boundary is malformed.
+    let mut bytes = StunMessage::new(StunMessageType::Request, [0x42; 12]).encode();
+    bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+    let result = StunMessage::decode(&bytes);
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -194,6 +214,38 @@ fn test_mapped_address_ipv6() {
     assert_eq!(decoded.family, addr.family);
     assert_eq!(decoded.port, addr.port);
     assert_eq!(decoded.address, addr.address);
+}
+
+#[test]
+fn test_decode_mapped_address_rejects_ipv4_trailing_bytes() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let mut encoded = MappedAddress::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478).encode();
+    assert_eq!(encoded.len(), 8);
+    encoded.push(0x00);
+
+    assert!(
+        MappedAddress::decode(&encoded).is_err(),
+        "RFC 5389 section 15.1 fixes an IPv4 MAPPED-ADDRESS at 8 bytes"
+    );
+}
+
+#[test]
+fn test_decode_mapped_address_rejects_ipv6_trailing_bytes() {
+    use std::net::{IpAddr, Ipv6Addr};
+
+    let mut encoded = MappedAddress::new(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        3478,
+    )
+    .encode();
+    assert_eq!(encoded.len(), 20);
+    encoded.push(0x00);
+
+    assert!(
+        MappedAddress::decode(&encoded).is_err(),
+        "RFC 5389 section 15.1 fixes an IPv6 MAPPED-ADDRESS at 20 bytes"
+    );
 }
 
 #[test]
@@ -325,15 +377,56 @@ fn test_message_integrity_accepts_twenty_byte_value() {
 }
 
 #[test]
-fn test_message_integrity_rejects_other_lengths() {
+fn test_message_integrity_attribute_preserves_other_lengths() {
+    // RFC 5389 section 15.4 defines a 20-byte value, but the structural decoder
+    // must not reject other lengths: agents ignore attributes after the first
+    // MESSAGE-INTEGRITY instead of discarding the whole message.
     for len in [0usize, 4, 16, 19, 21, 24] {
-        let err = StunAttribute::decode(&raw_attribute_bytes(0x0008, &vec![0u8; len]))
-            .expect_err(&format!("MESSAGE-INTEGRITY length {len} must be rejected"));
+        let attr = StunAttribute::decode(&raw_attribute_bytes(0x0008, &vec![0u8; len]))
+            .unwrap_or_else(|e| panic!("MESSAGE-INTEGRITY length {len} must decode: {e}"));
+        assert_eq!(attr.attribute_length, len as u16);
+        assert_eq!(attr.attribute_value.len(), len);
+    }
+}
+
+#[test]
+fn test_message_integrity_verification_rejects_other_lengths() {
+    use stun_protocol::integrity::short_term_key;
+
+    let key = short_term_key("VOkJxbRl1RmTxUk/WvJxBt").unwrap();
+    for len in [0usize, 4, 16, 19, 21, 24] {
+        let bytes = message_with_raw_attribute(0x0008, &vec![0u8; len]);
         assert!(
-            matches!(err, StunError::MalformedMessage(_)),
-            "MESSAGE-INTEGRITY length {len} must be MalformedMessage"
+            !StunMessage::verify_message_integrity(&bytes, &key),
+            "MESSAGE-INTEGRITY length {len} must not verify"
         );
     }
+}
+
+#[test]
+fn test_truncated_duplicate_integrity_is_ignored() {
+    use stun_protocol::integrity::short_term_key;
+
+    // RFC 5389 section 15.4: everything after the first MESSAGE-INTEGRITY is
+    // ignored, including a duplicate whose value is not 20 bytes.
+    let key = short_term_key("VOkJxbRl1RmTxUk/WvJxBt").unwrap();
+    let mut message = StunMessage::new(StunMessageType::Request, [0x11; 12]);
+    message.add_attribute(StunAttribute::new(
+        StunAttributeType::Software,
+        b"test".to_vec(),
+    ));
+    let mut bytes = message.encode_with_integrity(&key);
+
+    let duplicate = raw_attribute_bytes(0x0008, &[0xAA; 16]);
+    let length = u16::from_be_bytes([bytes[2], bytes[3]]) + duplicate.len() as u16;
+    bytes[2..4].copy_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(&duplicate);
+
+    let decoded = StunMessage::decode(&bytes).expect("duplicate must be ignored, not rejected");
+    assert_eq!(decoded.attributes.len(), 3);
+    assert!(decoded.attributes[2].raw_type == 0x0008);
+    assert_eq!(decoded.attributes[2].attribute_value.len(), 16);
+    assert!(StunMessage::verify_message_integrity(&bytes, &key));
 }
 
 #[test]
@@ -344,13 +437,24 @@ fn test_fingerprint_accepts_four_byte_value() {
 }
 
 #[test]
-fn test_fingerprint_rejects_other_lengths() {
+fn test_fingerprint_attribute_preserves_other_lengths() {
+    // RFC 5389 section 15.5 fixes a 4-byte value, but the structural decoder
+    // keeps other lengths so FINGERPRINT verification can reject the message.
     for len in [0usize, 2, 5, 8] {
-        let err = StunAttribute::decode(&raw_attribute_bytes(0x8028, &vec![0u8; len]))
-            .expect_err(&format!("FINGERPRINT length {len} must be rejected"));
+        let attr = StunAttribute::decode(&raw_attribute_bytes(0x8028, &vec![0u8; len]))
+            .unwrap_or_else(|e| panic!("FINGERPRINT length {len} must decode: {e}"));
+        assert_eq!(attr.attribute_length, len as u16);
+        assert_eq!(attr.attribute_value.len(), len);
+    }
+}
+
+#[test]
+fn test_fingerprint_verification_rejects_other_lengths() {
+    for len in [0usize, 2, 5, 8] {
+        let bytes = message_with_raw_attribute(0x8028, &vec![0u8; len]);
         assert!(
-            matches!(err, StunError::MalformedMessage(_)),
-            "FINGERPRINT length {len} must be MalformedMessage"
+            !StunMessage::verify_message_fingerprint(&bytes),
+            "FINGERPRINT length {len} must not verify"
         );
     }
 }
@@ -496,19 +600,32 @@ fn test_duplicate_integrity_attributes_are_countable() {
 }
 
 #[test]
-fn test_message_decode_validates_fixed_attribute_lengths() {
+fn test_message_decode_preserves_attribute_lengths() {
     let valid = message_with_raw_attribute(0x0008, &[0u8; 20]);
     let decoded = StunMessage::decode(&valid).unwrap();
     assert_eq!(decoded.attributes[0].raw_type, 0x0008);
 
-    let invalid = message_with_raw_attribute(0x0008, &[0u8; 16]);
-    let err = StunMessage::decode(&invalid).expect_err("short MESSAGE-INTEGRITY must fail");
-    assert!(matches!(err, StunError::MalformedMessage(_)));
+    // MESSAGE-INTEGRITY length is enforced when the digest is verified, so a
+    // malformed duplicate after the first one is ignored (RFC 5389 section
+    // 15.4) rather than rejecting the whole message.
+    let short_integrity = message_with_raw_attribute(0x0008, &[0u8; 16]);
+    let decoded = StunMessage::decode(&short_integrity)
+        .expect("a short MESSAGE-INTEGRITY is structurally valid");
+    assert_eq!(decoded.attributes[0].attribute_value.len(), 16);
+    assert!(!StunMessage::verify_message_integrity(
+        &short_integrity,
+        b"any-key"
+    ));
 
+    // FINGERPRINT length is enforced when the CRC is verified (RFC 5389
+    // section 15.5), not while parsing attributes.
     let invalid_fingerprint = message_with_raw_attribute(0x8028, &[0u8; 8]);
-    let err =
-        StunMessage::decode(&invalid_fingerprint).expect_err("oversized FINGERPRINT must fail");
-    assert!(matches!(err, StunError::MalformedMessage(_)));
+    let decoded = StunMessage::decode(&invalid_fingerprint)
+        .expect("an oversized FINGERPRINT is structurally valid");
+    assert_eq!(decoded.attributes[0].attribute_value.len(), 8);
+    assert!(!StunMessage::verify_message_fingerprint(
+        &invalid_fingerprint
+    ));
 }
 
 /// Build a Binding Request from raw attribute encodings with a header length
@@ -597,7 +714,7 @@ fn test_verify_fingerprint_rejects_duplicate_attributes() {
 }
 
 #[test]
-fn test_verify_integrity_rejects_duplicate_attributes() {
+fn test_verify_integrity_ignores_duplicate_attributes() {
     use stun_protocol::integrity::{hmac_input, hmac_sha1};
 
     let key = b"integrity-key";
@@ -605,14 +722,13 @@ fn test_verify_integrity_rejects_duplicate_attributes() {
         raw_attribute_bytes(0x0008, &[0u8; 20]),
         raw_attribute_bytes(0x0008, &[0u8; 20]),
     ]);
-    // Make the first MESSAGE-INTEGRITY valid so only uniqueness rejects it.
+    // The first MESSAGE-INTEGRITY is valid; the second is ignored because
+    // RFC 5389 section 15.4 ignores attributes after the first digest.
     let digest = hmac_sha1(key, &hmac_input(&bytes, 20));
     bytes[24..44].copy_from_slice(&digest);
 
-    assert!(
-        !StunMessage::verify_message_integrity(&bytes, key),
-        "duplicate MESSAGE-INTEGRITY must be rejected"
-    );
+    assert!(StunMessage::verify_message_integrity(&bytes, key));
+    assert!(!StunMessage::verify_message_integrity(&bytes, b"wrong-key"));
 }
 
 #[test]

@@ -13,16 +13,19 @@ use byteorder::{BigEndian, ByteOrder};
 /// The message type field is 2 bytes and encodes the message class and method.
 /// For Binding messages:
 /// - Request: 0x0001 (Section 3.1)
+/// - Indication: 0x0011 (Section 3.1)
 /// - Response: 0x0101 (Section 3.1)
-/// - ErrorIndication: 0x0111 (Section 3.1)
+/// - ErrorResponse: 0x0111 (Section 3.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StunMessageType {
     /// STUN Binding Request (0x0001) - RFC 5389 Section 3.1
     Request,
+    /// STUN Binding Indication (0x0011) - RFC 5389 Section 3.1
+    Indication,
     /// STUN Binding Success Response (0x0101) - RFC 5389 Section 3.1
     Response,
-    /// STUN Error Response (0x0111) - RFC 5389 Section 3.1
-    ErrorIndication,
+    /// STUN Binding Error Response (0x0111) - RFC 5389 Section 3.1
+    ErrorResponse,
 }
 
 impl StunMessageType {
@@ -30,8 +33,9 @@ impl StunMessageType {
     pub fn to_raw(&self) -> u16 {
         match self {
             StunMessageType::Request => 0x0001,
+            StunMessageType::Indication => 0x0011,
             StunMessageType::Response => 0x0101,
-            StunMessageType::ErrorIndication => 0x0111,
+            StunMessageType::ErrorResponse => 0x0111,
         }
     }
 
@@ -39,8 +43,9 @@ impl StunMessageType {
     pub fn from_raw(value: u16) -> Result<Self, StunError> {
         match value {
             0x0001 => Ok(StunMessageType::Request),
+            0x0011 => Ok(StunMessageType::Indication),
             0x0101 => Ok(StunMessageType::Response),
-            0x0111 => Ok(StunMessageType::ErrorIndication),
+            0x0111 => Ok(StunMessageType::ErrorResponse),
             _ => Err(StunError::InvalidMessageType(value)),
         }
     }
@@ -190,15 +195,13 @@ impl StunMessage {
 
     /// Verify the MESSAGE-INTEGRITY of an encoded message.
     ///
-    /// Returns `false` unless the message carries exactly one
-    /// MESSAGE-INTEGRITY attribute with a matching digest.
+    /// The digest is checked against the first MESSAGE-INTEGRITY attribute.
+    /// Attributes after it, including a duplicate MESSAGE-INTEGRITY, are
+    /// ignored as required by RFC 5389 section 15.4.
     pub fn verify_message_integrity(encoded: &[u8], key: &[u8]) -> bool {
         let Ok(message) = Self::decode(encoded) else {
             return false;
         };
-        if message.attribute_count(StunAttributeType::MessageIntegrity as u16) != 1 {
-            return false;
-        }
         let Some(index) = message
             .attributes
             .iter()
@@ -304,10 +307,12 @@ impl StunMessage {
         let mut transaction_id = [0u8; 12];
         transaction_id.copy_from_slice(&data[8..20]);
 
-        // Validate message length
-        if data.len() < HEADER_SIZE + message_length as usize {
+        // Validate message length. RFC 5389 section 6: the message length
+        // delimits the message, so trailing bytes are a malformed datagram.
+        let expected = HEADER_SIZE + message_length as usize;
+        if data.len() != expected {
             return Err(StunError::MalformedMessage(format!(
-                "Message length mismatch: header says {} bytes, but only {} bytes available",
+                "Message length mismatch: header says {} bytes, but {} bytes available",
                 message_length,
                 data.len() - HEADER_SIZE
             )));

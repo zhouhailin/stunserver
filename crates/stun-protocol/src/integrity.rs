@@ -72,32 +72,50 @@ pub fn hmac_input(message: &[u8], mi_offset: usize) -> Vec<u8> {
     input
 }
 
-/// Apply SASLprep (RFC 4013) to a password.
-pub fn saslprep(password: &str) -> Result<String, StunError> {
-    stringprep::saslprep(password)
+/// Apply SASLprep (RFC 4013) to a credential string.
+///
+/// RFC 5389 sections 15.3, 15.4, and 15.7 require this preparation for
+/// USERNAME, passwords, and REALM respectively.
+pub fn saslprep(value: &str) -> Result<String, StunError> {
+    stringprep::saslprep(value)
         .map(|prepared| prepared.into_owned())
         .map_err(|e| StunError::MalformedMessage(format!("SASLprep failed: {e}")))
 }
 
+/// Remove the credential decorations that RFC 5389 section 15.4 excludes from
+/// key derivation: quotes and trailing nulls from USERNAME and REALM, trailing
+/// nulls only from the password.
+fn strip_credential(value: &str, strip_quotes: bool) -> &str {
+    let value = value.trim_end_matches('\0');
+    if strip_quotes {
+        value.trim_matches('"')
+    } else {
+        value
+    }
+}
+
 /// Derive the long-term MESSAGE-INTEGRITY key.
 ///
-/// The key is `MD5(username ":" realm ":" SASLprep(password))`
-/// (RFC 5389 section 10.2.2). Only the password is prepared; the username and
-/// realm are used as supplied.
+/// The key is `MD5(username ":" realm ":" SASLprep(password))`, where USERNAME
+/// and REALM lose any quotes and trailing nulls before SASLprep (RFC 5389
+/// sections 10.2.2, 15.3, 15.4, and 15.7).
 pub fn long_term_key(username: &str, realm: &str, password: &str) -> Result<[u8; 16], StunError> {
-    let prepared = saslprep(password)?;
+    let username = saslprep(strip_credential(username, true))?;
+    let realm = saslprep(strip_credential(realm, true))?;
+    let password = saslprep(strip_credential(password, false))?;
     let mut hasher = Md5::new();
     hasher.update(username.as_bytes());
     hasher.update(b":");
     hasher.update(realm.as_bytes());
     hasher.update(b":");
-    hasher.update(prepared.as_bytes());
+    hasher.update(password.as_bytes());
     Ok(hasher.finalize().into())
 }
 
-/// Short-term MESSAGE-INTEGRITY keys are the configured password bytes.
-pub fn short_term_key(password: &str) -> Vec<u8> {
-    password.as_bytes().to_vec()
+/// Short-term MESSAGE-INTEGRITY keys are the SASLprep-prepared password bytes
+/// (RFC 5389 section 15.4).
+pub fn short_term_key(password: &str) -> Result<Vec<u8>, StunError> {
+    saslprep(password).map(String::into_bytes)
 }
 
 #[cfg(test)]

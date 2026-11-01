@@ -157,15 +157,19 @@ impl AuthService {
     }
 
     fn authenticate_short_term(&self, encoded: &[u8], message: &StunMessage) -> AuthOutcome {
-        let mi_present = message.attribute_count(StunAttributeType::MessageIntegrity as u16) == 1;
-        let Some(username) = text_attribute(message, StunAttributeType::Username) else {
-            return AuthOutcome::rejected(400, false, "missing USERNAME");
+        let mi_present = message.attribute_count(StunAttributeType::MessageIntegrity as u16) > 0;
+        let username_raw = raw_attribute(message, StunAttributeType::Username);
+        let (Some(username_raw), true) = (username_raw, mi_present) else {
+            return AuthOutcome::rejected(400, false, "missing USERNAME or MESSAGE-INTEGRITY");
         };
-        if !mi_present {
-            return AuthOutcome::rejected(400, false, "missing MESSAGE-INTEGRITY");
+        let Some(username) = prepare_text(username_raw) else {
+            return AuthOutcome::rejected(401, false, "invalid USERNAME");
+        };
+        if username.len() > AuthConfig::MAX_USERNAME_BYTES {
+            return AuthOutcome::rejected(400, false, "USERNAME too long");
         }
 
-        let Some(key) = self.table.key_for(username) else {
+        let Some(key) = self.table.key_for(&username) else {
             return AuthOutcome::rejected(401, false, "unknown USERNAME");
         };
         if !verify_integrity(encoded, message, key) {
@@ -175,27 +179,46 @@ impl AuthService {
     }
 
     fn authenticate_long_term(&self, encoded: &[u8], message: &StunMessage) -> AuthOutcome {
-        let mi_present = message.attribute_count(StunAttributeType::MessageIntegrity as u16) == 1;
+        let mi_present = message.attribute_count(StunAttributeType::MessageIntegrity as u16) > 0;
         if !mi_present {
             return AuthOutcome::rejected(401, true, "missing MESSAGE-INTEGRITY");
         }
 
-        let username = text_attribute(message, StunAttributeType::Username);
-        let realm = text_attribute(message, StunAttributeType::Realm);
-        let nonce = text_attribute(message, StunAttributeType::Nonce);
-        let (Some(username), Some(realm), Some(nonce)) = (username, realm, nonce) else {
-            return AuthOutcome::rejected(400, false, "missing long-term attributes");
+        let username_raw = raw_attribute(message, StunAttributeType::Username);
+        let realm_raw = raw_attribute(message, StunAttributeType::Realm);
+        let nonce_raw = raw_attribute(message, StunAttributeType::Nonce);
+        let (Some(username_raw), Some(realm_raw), Some(nonce_raw)) =
+            (username_raw, realm_raw, nonce_raw)
+        else {
+            return AuthOutcome::rejected(400, false, "missing long-term attribute");
         };
 
+        let Some(nonce) = std::str::from_utf8(nonce_raw).ok() else {
+            return AuthOutcome::rejected(438, true, "invalid NONCE");
+        };
         if self.verify_nonce(nonce) != NonceStatus::Fresh {
             return AuthOutcome::rejected(438, true, "stale or invalid NONCE");
+        }
+
+        let Some(username) = prepare_text(username_raw) else {
+            return AuthOutcome::rejected(401, true, "invalid USERNAME");
+        };
+        let Some(realm) = prepare_text(realm_raw) else {
+            return AuthOutcome::rejected(401, true, "invalid REALM");
+        };
+
+        if username.len() > AuthConfig::MAX_USERNAME_BYTES
+            || realm.chars().count() > AuthConfig::MAX_REALM_CHARS
+            || nonce.chars().count() > AuthConfig::MAX_REALM_CHARS
+        {
+            return AuthOutcome::rejected(400, false, "long-term attribute too long");
         }
 
         if realm != self.table.realm() {
             return AuthOutcome::rejected(401, true, "REALM mismatch");
         }
 
-        let Some(key) = self.table.key_for(username) else {
+        let Some(key) = self.table.key_for(&username) else {
             return AuthOutcome::rejected(401, true, "unknown USERNAME");
         };
         if !verify_integrity(encoded, message, key) {
@@ -205,20 +228,24 @@ impl AuthService {
     }
 }
 
-/// Read a UTF-8 attribute that appears before MESSAGE-INTEGRITY. Attributes
-/// after MESSAGE-INTEGRITY are ignored for authentication.
-fn text_attribute(message: &StunMessage, attribute_type: StunAttributeType) -> Option<&str> {
-    for attribute in &message.attributes {
-        if attribute.raw_type == StunAttributeType::MessageIntegrity as u16 {
-            break;
-        }
-        if attribute.raw_type == attribute_type as u16 {
-            return std::str::from_utf8(&attribute.attribute_value)
-                .ok()
-                .filter(|text| !text.is_empty());
-        }
-    }
-    None
+/// Raw value of the first `attribute_type` attribute before MESSAGE-INTEGRITY.
+/// Attributes after MESSAGE-INTEGRITY are ignored for authentication.
+fn raw_attribute(message: &StunMessage, attribute_type: StunAttributeType) -> Option<&[u8]> {
+    message
+        .attributes
+        .iter()
+        .take_while(|attribute| attribute.raw_type != StunAttributeType::MessageIntegrity as u16)
+        .find(|attribute| attribute.raw_type == attribute_type as u16)
+        .map(|attribute| attribute.attribute_value.as_slice())
+}
+
+/// Apply SASLprep to a USERNAME or REALM value (RFC 5389 sections 15.3, 15.7).
+/// Returns `None` for empty, non-UTF-8, or un-preparable values.
+fn prepare_text(value: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(value)
+        .ok()
+        .filter(|text| !text.is_empty())?;
+    stun_protocol::integrity::saslprep(text).ok()
 }
 
 fn verify_integrity(encoded: &[u8], message: &StunMessage, key: &[u8]) -> bool {
@@ -313,7 +340,11 @@ password = "s3cret"
         let tampered: String = nonce
             .chars()
             .enumerate()
-            .map(|(i, c)| if i == 20 { '0' } else { c })
+            .map(|(i, c)| match (i, c) {
+                (20, '0') => '1',
+                (20, _) => '0',
+                _ => c,
+            })
             .collect();
         assert_eq!(
             service.verify_nonce_at(&tampered, 1_000),

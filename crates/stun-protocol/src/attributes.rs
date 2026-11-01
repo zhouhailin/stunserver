@@ -159,20 +159,10 @@ impl StunAttribute {
 
         let attribute_length = BigEndian::read_u16(&data[2..4]);
 
-        // RFC 5389 sections 15.4 and 15.5 fix these value lengths.
-        match (attr_type_raw, attribute_length) {
-            (0x0008, len) if len != 20 => {
-                return Err(StunError::MalformedMessage(format!(
-                    "MESSAGE-INTEGRITY value must be 20 bytes, got {len}"
-                )));
-            }
-            (0x8028, len) if len != 4 => {
-                return Err(StunError::MalformedMessage(format!(
-                    "FINGERPRINT value must be 4 bytes, got {len}"
-                )));
-            }
-            _ => {}
-        }
+        // Value-length rules (RFC 5389 sections 15.4 and 15.5) are enforced by
+        // the integrity checks, not by structural parsing: a malformed
+        // attribute after the first MESSAGE-INTEGRITY must be ignored instead
+        // of rejecting the whole message.
 
         let value_end = 4 + attribute_length as usize;
         if data.len() < value_end {

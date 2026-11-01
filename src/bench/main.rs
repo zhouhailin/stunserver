@@ -4,15 +4,23 @@
 //! configurable QPS rate and reports latency percentiles and success rates.
 
 use chrono::Local;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::io::Write;
 use std::process;
 use std::time::Duration;
 use stunbench::{
     address::{AddressFamily, NetworkAddress},
-    bench::{self, BenchConfig},
+    bench::{self, BenchAuth, BenchConfig},
     metadata::BuildMetadata,
 };
+
+/// Credential mode requested on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AuthModeArg {
+    Disabled,
+    ShortTerm,
+    LongTerm,
+}
 
 /// Command-line arguments for stunbench.
 #[derive(Parser, Debug)]
@@ -62,6 +70,23 @@ struct Args {
     /// Append a valid terminal FINGERPRINT to every request.
     #[arg(long)]
     fingerprint: bool,
+
+    /// Credential mode: disabled, short-term, or long-term.
+    #[arg(long, value_enum, default_value = "disabled")]
+    auth_mode: AuthModeArg,
+
+    /// Username for short-term or long-term credentials.
+    #[arg(long)]
+    username: Option<String>,
+
+    /// Password for short-term or long-term credentials. Visible in process
+    /// listings; prefer the STUNBENCH_PASSWORD environment variable.
+    #[arg(long)]
+    password: Option<String>,
+
+    /// REALM for long-term credentials, overriding the server challenge realm.
+    #[arg(long)]
+    realm: Option<String>,
 }
 
 fn main() {
@@ -84,6 +109,17 @@ fn main() {
         std::env::set_var("RUST_LOG", level);
     }
     init_console_logging();
+
+    let auth = match resolve_auth(&args, std::env::var("STUNBENCH_PASSWORD").ok().as_deref()) {
+        Ok(auth) => auth,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+    if let Some(warning) = password_warning(&args) {
+        log::warn!("{}", warning);
+    }
 
     // Determine address family filter.
     let family = if args.ipv4_only {
@@ -124,6 +160,7 @@ fn main() {
             duration: None,
             request_count: Some(requests),
             fingerprint: args.fingerprint,
+            auth: auth.clone(),
         }
     } else {
         println!(
@@ -136,6 +173,7 @@ fn main() {
             duration: Some(Duration::from_secs(args.duration)),
             request_count: None,
             fingerprint: args.fingerprint,
+            auth,
         }
     };
 
@@ -172,6 +210,63 @@ fn main() {
             process::exit(3);
         }
     }
+}
+
+/// Build benchmark credentials from CLI flags plus the optional env-var password.
+fn resolve_auth(args: &Args, env_password: Option<&str>) -> Result<BenchAuth, String> {
+    match args.auth_mode {
+        AuthModeArg::Disabled => {
+            if args.username.is_some() || args.password.is_some() {
+                return Err(
+                    "--username/--password require --auth-mode short-term or long-term".to_string(),
+                );
+            }
+            if args.realm.is_some() {
+                return Err("--realm requires --auth-mode long-term".to_string());
+            }
+            Ok(BenchAuth::disabled())
+        }
+        AuthModeArg::ShortTerm | AuthModeArg::LongTerm => {
+            if args.auth_mode != AuthModeArg::LongTerm && args.realm.is_some() {
+                return Err("--realm requires --auth-mode long-term".to_string());
+            }
+            let realm = match args.realm.as_deref() {
+                Some("") => return Err("--realm must not be empty".to_string()),
+                realm => realm,
+            };
+            let username = args
+                .username
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    "--username is required when authentication is enabled".to_string()
+                })?;
+            let password = args
+                .password
+                .as_deref()
+                .or(env_password)
+                .filter(|secret| !secret.is_empty())
+                .ok_or_else(|| {
+                    "--password or STUNBENCH_PASSWORD is required when authentication is enabled"
+                        .to_string()
+                })?;
+            Ok(match args.auth_mode {
+                AuthModeArg::LongTerm => match realm {
+                    Some(realm) => BenchAuth::long_term_with_realm(username, password, realm),
+                    None => BenchAuth::long_term(username, password),
+                },
+                _ => BenchAuth::short_term(username, password),
+            })
+        }
+    }
+}
+
+/// Warn that `--password` leaks through process listings when debug logging is on.
+fn password_warning(args: &Args) -> Option<String> {
+    if !args.debug || args.password.is_none() {
+        return None;
+    }
+    Some("--password is visible in process listings; prefer STUNBENCH_PASSWORD instead".to_string())
 }
 
 /// Initialize console logging with the same format as the server.
@@ -270,5 +365,282 @@ mod tests {
         let help = Args::command().render_help().to_string();
         assert!(help.contains("--trace"));
         assert!(help.contains("prints raw packet bytes"));
+    }
+
+    #[test]
+    fn test_auth_mode_defaults_to_disabled() {
+        let args = parse(&["stunbench", "127.0.0.1", "--qps", "10"]);
+        assert_eq!(args.auth_mode, AuthModeArg::Disabled);
+    }
+
+    #[test]
+    fn test_auth_mode_accepts_short_term_and_long_term() {
+        let short = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "short-term",
+        ]);
+        assert_eq!(short.auth_mode, AuthModeArg::ShortTerm);
+        let long = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "long-term",
+        ]);
+        assert_eq!(long.auth_mode, AuthModeArg::LongTerm);
+    }
+
+    #[test]
+    fn test_auth_mode_rejects_unknown_value() {
+        assert!(Args::try_parse_from([
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "bogus",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_requires_username() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "short-term",
+            "--password",
+            "s3cret",
+        ]);
+        assert!(resolve_auth(&args, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_requires_password() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+        ]);
+        assert!(resolve_auth(&args, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_prefers_password_flag_over_env() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "short-term",
+            "--username",
+            "alice",
+            "--password",
+            "from-flag",
+        ]);
+        let auth = resolve_auth(&args, Some("from-env")).unwrap();
+        assert_eq!(auth.mode(), bench::AuthMode::ShortTerm);
+        assert_eq!(auth.username(), Some("alice"));
+        assert_eq!(auth.password(), Some("from-flag"));
+    }
+
+    #[test]
+    fn test_resolve_auth_reads_password_from_env() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+        ]);
+        let auth = resolve_auth(&args, Some("from-env")).unwrap();
+        assert_eq!(auth.mode(), bench::AuthMode::LongTerm);
+        assert_eq!(auth.password(), Some("from-env"));
+    }
+
+    #[test]
+    fn test_resolve_auth_rejects_credentials_with_disabled() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+        ]);
+        assert!(resolve_auth(&args, None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_disabled_has_no_credentials() {
+        let args = parse(&["stunbench", "127.0.0.1", "--qps", "10"]);
+        let auth = resolve_auth(&args, None).unwrap();
+        assert_eq!(auth.mode(), bench::AuthMode::Disabled);
+        assert_eq!(auth.username(), None);
+        assert_eq!(auth.password(), None);
+    }
+
+    #[test]
+    fn test_password_warning_only_with_debug_flag() {
+        let plain = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--password",
+            "s3cret",
+        ]);
+        assert!(password_warning(&plain).is_none());
+
+        let debug = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--debug",
+            "--password",
+            "s3cret",
+        ]);
+        assert!(password_warning(&debug).is_some());
+    }
+
+    #[test]
+    fn test_help_documents_auth_options() {
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("--auth-mode"));
+        assert!(help.contains("--username"));
+        assert!(help.contains("--password"));
+        assert!(help.contains("STUNBENCH_PASSWORD"));
+    }
+
+    #[test]
+    fn test_realm_flag_parsed() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--realm",
+            "example.org",
+        ]);
+        assert_eq!(args.realm.as_deref(), Some("example.org"));
+    }
+
+    #[test]
+    fn test_help_documents_realm() {
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("--realm"));
+    }
+
+    #[test]
+    fn test_resolve_auth_rejects_realm_with_disabled() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--realm",
+            "example.org",
+        ]);
+        let err = resolve_auth(&args, None).unwrap_err();
+        assert_eq!(err, "--realm requires --auth-mode long-term");
+    }
+
+    #[test]
+    fn test_resolve_auth_rejects_realm_with_short_term() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "short-term",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+            "--realm",
+            "example.org",
+        ]);
+        let err = resolve_auth(&args, None).unwrap_err();
+        assert_eq!(err, "--realm requires --auth-mode long-term");
+    }
+
+    #[test]
+    fn test_resolve_auth_rejects_empty_realm() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+            "--realm",
+            "",
+        ]);
+        let err = resolve_auth(&args, None).unwrap_err();
+        assert_eq!(err, "--realm must not be empty");
+    }
+
+    #[test]
+    fn test_resolve_auth_applies_long_term_realm_override() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+            "--realm",
+            "example.org",
+        ]);
+        let auth = resolve_auth(&args, None).unwrap();
+        assert_eq!(auth.mode(), bench::AuthMode::LongTerm);
+        assert_eq!(auth.realm(), Some("example.org"));
+    }
+
+    #[test]
+    fn test_resolve_auth_long_term_without_realm_has_no_override() {
+        let args = parse(&[
+            "stunbench",
+            "127.0.0.1",
+            "--qps",
+            "10",
+            "--auth-mode",
+            "long-term",
+            "--username",
+            "alice",
+            "--password",
+            "s3cret",
+        ]);
+        let auth = resolve_auth(&args, None).unwrap();
+        assert_eq!(auth.realm(), None);
     }
 }

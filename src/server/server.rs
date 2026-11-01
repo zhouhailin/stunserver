@@ -5,7 +5,7 @@
 //! reflexive address.
 
 use crate::auth::{AuthOutcome, AuthService};
-use crate::config::ServerConfig;
+use crate::config::{NetworkConfig, ServerConfig};
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 use std::fmt;
@@ -18,10 +18,39 @@ use stun_protocol::{
 };
 use tokio::net::UdpSocket;
 use tokio::signal;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Size of the pre-allocated receive buffer (64 KB, well above STUN max).
 const RECV_BUF_SIZE: usize = 65536;
+
+/// Bind the STUN UDP listener with explicit kernel buffer sizes.
+///
+/// The kernel silently caps these at `net.core.rmem_max` / `net.core.wmem_max`.
+fn bind_udp_socket(
+    addr: SocketAddr,
+    recv_size: usize,
+    send_size: usize,
+) -> std::io::Result<UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    socket.set_nonblocking(true)?;
+    socket.set_recv_buffer_size(recv_size)?;
+    socket.set_send_buffer_size(send_size)?;
+    socket.bind(&addr.into())?;
+    UdpSocket::from_std(socket.into())
+}
+
+/// Reserve one in-flight request slot, bounded by `max_connections`.
+///
+/// Datagrams that arrive when every slot is busy are dropped so memory and
+/// task count stay bounded under overload.
+fn try_handler_slot(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    slots.clone().try_acquire_owned().ok()
+}
 
 /// SOFTWARE attribute value, identical across every response.
 pub const SOFTWARE: &str = concat!("stunserver ", env!("CARGO_PKG_VERSION"));
@@ -43,7 +72,7 @@ pub enum IntakeRejection {
         value_len: usize,
         reason: &'static str,
     },
-    /// MESSAGE-INTEGRITY is duplicated or has the wrong length.
+    /// MESSAGE-INTEGRITY has the wrong length.
     MessageIntegrity {
         attribute_type: u16,
         value_len: usize,
@@ -79,8 +108,10 @@ impl fmt::Display for IntakeRejection {
 /// Validate a datagram up to, but not including, the authentication stage.
 ///
 /// Pipeline order (FR-008-FR-013): header decode and Binding Request check,
-/// then FINGERPRINT position/length/CRC, then MESSAGE-INTEGRITY length and
-/// uniqueness. Returns the decoded request when it may be processed further.
+/// then FINGERPRINT position/length/CRC, then the first MESSAGE-INTEGRITY's
+/// length. Duplicate MESSAGE-INTEGRITY attributes are ignored as required by
+/// RFC 5389 section 15.4. Returns the decoded request when it may be processed
+/// further.
 pub(crate) fn intake(encoded: &[u8]) -> Result<StunMessage, IntakeRejection> {
     let message =
         StunMessage::decode(encoded).map_err(|error| IntakeRejection::Decode(error.to_string()))?;
@@ -103,6 +134,13 @@ pub(crate) fn intake(encoded: &[u8]) -> Result<StunMessage, IntakeRejection> {
                 attribute_type: fingerprint_type,
                 value_len,
                 reason: "duplicate attribute",
+            });
+        }
+        if value_len != stun_protocol::integrity::FINGERPRINT_LEN {
+            return Err(IntakeRejection::Fingerprint {
+                attribute_type: fingerprint_type,
+                value_len,
+                reason: "value must be 4 bytes",
             });
         }
         if message.attributes.last().map(|attr| attr.raw_type) != Some(fingerprint_type) {
@@ -130,13 +168,6 @@ pub(crate) fn intake(encoded: &[u8]) -> Result<StunMessage, IntakeRejection> {
             .find(|attr| attr.raw_type == integrity_type)
             .map(|attr| attr.attribute_value.len())
             .unwrap_or(0);
-        if integrity_count > 1 {
-            return Err(IntakeRejection::MessageIntegrity {
-                attribute_type: integrity_type,
-                value_len,
-                reason: "duplicate attribute",
-            });
-        }
         if value_len != stun_protocol::integrity::MESSAGE_INTEGRITY_LEN {
             return Err(IntakeRejection::MessageIntegrity {
                 attribute_type: integrity_type,
@@ -303,7 +334,7 @@ fn build_auth_error_response(
     challenge: bool,
     auth: &AuthService,
 ) -> StunMessage {
-    let mut response = StunMessage::new(StunMessageType::ErrorIndication, request.transaction_id);
+    let mut response = StunMessage::new(StunMessageType::ErrorResponse, request.transaction_id);
 
     let reason = match status {
         400 => "Bad Request",
@@ -311,7 +342,8 @@ fn build_auth_error_response(
         438 => "Stale Nonce",
         _ => "Error",
     };
-    let code = ErrorCode::new(4, (status % 100) as u8, reason.to_string());
+    let code = ErrorCode::new(4, (status % 100) as u8, reason.to_string())
+        .expect("authentication statuses are valid ERROR-CODEs");
     response.add_attribute(StunAttribute::new(
         StunAttributeType::ErrorCode,
         code.encode_value(),
@@ -332,20 +364,42 @@ fn build_auth_error_response(
     response
 }
 
-/// RFC 5780 behavior-discovery attributes this single-address server rejects.
-const REJECTED_REQUIRED: &[u16] = &[
+/// RFC 5780 behavior-discovery attributes this single-address server
+/// intercepts. All three are comprehension-required, so RFC 5389 §7.3.1
+/// reports them in an ERROR-CODE 420 response (RFC 5780 §6.1, §7.5).
+const INTERCEPTED_RFC5780: &[u16] = &[
     StunAttributeType::ChangeRequest as u16,
     StunAttributeType::Padding as u16,
     StunAttributeType::ResponsePort as u16,
 ];
 
+/// Classification of a comprehension-required attribute before responding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredAttribute {
+    /// Recognized; acted upon or deliberately ignored.
+    Supported,
+    /// RFC 5780 behavior-discovery attribute this server refuses.
+    InterceptedRfc5780(u16),
+    /// Comprehension-required attribute with no registry entry.
+    Unrecognized(u16),
+}
+
+fn classify_required_attribute(raw_type: u16) -> RequiredAttribute {
+    if INTERCEPTED_RFC5780.contains(&raw_type) {
+        RequiredAttribute::InterceptedRfc5780(raw_type)
+    } else if StunAttributeType::from_raw(raw_type) == StunAttributeType::Unknown {
+        RequiredAttribute::Unrecognized(raw_type)
+    } else {
+        RequiredAttribute::Supported
+    }
+}
+
 /// Collect comprehension-required attribute types this server cannot honor,
 /// preserving first-seen order and de-duplicating.
 ///
-/// Known attributes (including authentication attributes and the
-/// not-acted-upon MAPPED-ADDRESS, ERROR-CODE, UNKNOWN-ATTRIBUTES, and
-/// ALTERNATE-SERVER) are ignored. Attributes after MESSAGE-INTEGRITY are
-/// excluded from classification (RFC 5389 §15.4).
+/// RFC 5780 behavior-discovery attributes are intercepted explicitly and
+/// reported alongside genuinely unrecognized types. Attributes after
+/// MESSAGE-INTEGRITY are excluded from classification (RFC 5389 §15.4).
 fn unsupported_required_attributes(request: &StunMessage) -> Vec<u16> {
     let mut types: Vec<u16> = Vec::new();
 
@@ -356,10 +410,24 @@ fn unsupported_required_attributes(request: &StunMessage) -> Vec<u16> {
         if !is_comprehension_required(attr.raw_type) {
             continue;
         }
-        let recognized = StunAttributeType::from_raw(attr.raw_type) != StunAttributeType::Unknown;
-        let rejected = REJECTED_REQUIRED.contains(&attr.raw_type) || !recognized;
-        if rejected && !types.contains(&attr.raw_type) {
-            types.push(attr.raw_type);
+
+        match classify_required_attribute(attr.raw_type) {
+            RequiredAttribute::Supported => {}
+            RequiredAttribute::InterceptedRfc5780(raw_type) => {
+                if !types.contains(&raw_type) {
+                    debug!(
+                        "Intercepted RFC 5780 {:?} (0x{raw_type:04X})",
+                        StunAttributeType::from_raw(raw_type)
+                    );
+                    types.push(raw_type);
+                }
+            }
+            RequiredAttribute::Unrecognized(raw_type) => {
+                if !types.contains(&raw_type) {
+                    debug!("Unrecognized comprehension-required attribute 0x{raw_type:04X}");
+                    types.push(raw_type);
+                }
+            }
         }
     }
 
@@ -368,9 +436,10 @@ fn unsupported_required_attributes(request: &StunMessage) -> Vec<u16> {
 
 /// Build a 420 Unknown Attribute error response.
 fn build_unknown_attribute_response(request: &StunMessage, unknown: Vec<u16>) -> StunMessage {
-    let mut response = StunMessage::new(StunMessageType::ErrorIndication, request.transaction_id);
+    let mut response = StunMessage::new(StunMessageType::ErrorResponse, request.transaction_id);
 
-    let code = ErrorCode::new(4, 20, "Unknown Attribute".to_string());
+    let code =
+        ErrorCode::new(4, 20, "Unknown Attribute".to_string()).expect("420 is a valid ERROR-CODE");
     response.add_attribute(StunAttribute::new(
         StunAttributeType::ErrorCode,
         code.encode_value(),
@@ -407,14 +476,25 @@ fn build_success_response(request: &StunMessage, client_addr: SocketAddr) -> Stu
 /// is received.
 pub async fn run_server(
     config: &ServerConfig,
+    network: &NetworkConfig,
     state: Arc<ServerState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = config.socket_addr()?;
 
-    let socket = UdpSocket::bind(listen_addr).await?;
+    let socket = bind_udp_socket(
+        listen_addr,
+        network.udp_recv_buffer_size,
+        network.udp_send_buffer_size,
+    )?;
     let socket = Arc::new(socket);
+    debug!(
+        "UDP socket buffers requested: recv={} send={} (kernel caps at net.core.rmem_max/wmem_max)",
+        network.udp_recv_buffer_size, network.udp_send_buffer_size
+    );
 
     info!("STUN server listening on {}", listen_addr);
+
+    let slots = Arc::new(Semaphore::new(config.max_connections));
 
     // Shutdown coordination.
     let shutdown = Arc::new(Notify::new());
@@ -434,12 +514,22 @@ pub async fn run_server(
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((len, client_addr)) => {
+                        let Some(permit) = try_handler_slot(&slots) else {
+                            state.inc_errors();
+                            debug!(
+                                "Dropping datagram from {}: handler limit {} reached",
+                                client_addr, config.max_connections
+                            );
+                            continue;
+                        };
+
                         let sock = socket.clone();
                         let state = state.clone();
                         let data = buf[..len].to_vec();
 
                         // Spawn a task for each request to maximize concurrency.
                         tokio::spawn(async move {
+                            let _permit = permit;
                             state.inc_requests();
                             debug!("Request from {} ({} bytes)", client_addr, len);
 
@@ -527,6 +617,33 @@ mod tests {
         assert_eq!(state.inc_errors(), 1);
         assert_eq!(state.inc_errors(), 2);
         assert_eq!(state.error_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bind_udp_socket_applies_buffer_sizes() {
+        let plain = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let plain = socket2::SockRef::from(&plain);
+        let default_recv = plain.recv_buffer_size().unwrap();
+        let default_send = plain.send_buffer_size().unwrap();
+
+        let socket =
+            bind_udp_socket("127.0.0.1:0".parse().unwrap(), 4 * 1024 * 1024, 1024 * 1024).unwrap();
+        let std_socket = socket.into_std().unwrap();
+        let socket = socket2::SockRef::from(&std_socket);
+
+        // The kernel caps the request at net.core.rmem_max/wmem_max, but a
+        // tuned socket must still exceed the system default.
+        assert!(socket.recv_buffer_size().unwrap() > default_recv);
+        assert!(socket.send_buffer_size().unwrap() > default_send);
+    }
+
+    #[test]
+    fn test_handler_slots_are_bounded_by_max_connections() {
+        let slots = Arc::new(Semaphore::new(1));
+        let first = try_handler_slot(&slots).expect("first slot is free");
+        assert!(try_handler_slot(&slots).is_none());
+        drop(first);
+        assert!(try_handler_slot(&slots).is_some());
     }
 
     #[test]
@@ -817,7 +934,7 @@ mod tests {
         let response_bytes = build_response(&request_bytes, client_addr).unwrap();
         let response = StunMessage::decode(&response_bytes).unwrap();
 
-        assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+        assert_eq!(response.message_type, StunMessageType::ErrorResponse);
         assert_eq!(response.transaction_id, transaction_id);
         assert_eq!(response.magic_cookie, request.magic_cookie);
         assert_eq!(response.attributes.len(), 3);
@@ -864,7 +981,7 @@ mod tests {
         let response_bytes = build_response(&request_bytes, client_addr).unwrap();
         let response = StunMessage::decode(&response_bytes).unwrap();
 
-        assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+        assert_eq!(response.message_type, StunMessageType::ErrorResponse);
         let unknown =
             UnknownAttributes::decode_value(&response.attributes[1].attribute_value).unwrap();
         assert_eq!(unknown.types, vec![0x0024, 0x0025]);
@@ -907,7 +1024,7 @@ mod tests {
         let response_bytes = build_response(&request_bytes, client_addr).unwrap();
         let response = StunMessage::decode(&response_bytes).unwrap();
 
-        assert_eq!(response.message_type, StunMessageType::ErrorIndication);
+        assert_eq!(response.message_type, StunMessageType::ErrorResponse);
         let unknown =
             UnknownAttributes::decode_value(&response.attributes[1].attribute_value).unwrap();
         assert_eq!(unknown.types, vec![0x0024]);
