@@ -34,6 +34,9 @@ retention_days = 30
 # 是否启用控制台输出
 enable_console = true
 
+# 是否启用文件日志（默认 false，仅输出到控制台）
+enable_file = false
+
 # 轮转后的日志文件是否 gzip 压缩（生成 .gz 文件）
 compress_rotated_logs = true
 

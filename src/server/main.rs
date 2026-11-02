@@ -43,11 +43,14 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
+    let get_env = |key: &str| std::env::var(key).ok();
 
-    // Load configuration: CLI args override file values, file overrides defaults.
-    // Without --config, config/stunserver.conf is loaded when it exists.
+    // Precedence: CLI > environment > config file > built-in defaults.
+    // Without --config or STUN_CONFIG_PATH, config/stunserver.conf is loaded
+    // when it exists.
+    let config_path = config::resolve_config_path(args.config.clone(), get_env);
     let mut cfg = match config::load_config_or_default(
-        args.config.as_deref(),
+        config_path.as_deref(),
         std::path::Path::new(config::DEFAULT_CONFIG_PATH),
     ) {
         Ok(c) => c,
@@ -56,6 +59,12 @@ fn main() {
             process::exit(1);
         }
     };
+
+    // Environment overrides, applied before CLI overrides.
+    if let Err(e) = config::apply_env_overrides(&mut cfg, get_env) {
+        eprintln!("Error: {}", e);
+        process::exit(1);
+    }
 
     // CLI overrides.
     if let Some(listen) = args.listen {

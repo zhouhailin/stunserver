@@ -9,27 +9,14 @@ services:
     image: stunserver:latest
     container_name: stunserver
     restart: unless-stopped
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
+    # Host networking is the default to avoid Docker NAT for UDP/STUN.
+    network_mode: host
     volumes:
-      - ./config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro
+      - ../config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro
       - stunserver-logs:/opt/stunserver/log
     environment:
       - STUN_LOG_LEVEL=info
-    healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "3478"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    networks:
-      - stunserver-net
 
 volumes:
   stunserver-logs:
     driver: local
-
-networks:
-  stunserver-net:
-    driver: bridge

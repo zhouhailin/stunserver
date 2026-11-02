@@ -4,10 +4,14 @@
 
 ## 配置从哪来
 
-- **默认加载**：未传入 `--config` 时，服务自动读取工作目录下的 `config/stunserver.conf`；该文件不存在则使用内置默认值。
-- **显式指定**：`--config <path>` 优先于默认路径；指定的文件不存在会直接报错退出。
+- **默认加载**：未传入 `--config` 且未设置 `STUN_CONFIG_PATH` 时，服务自动读取工作目录下的 `config/stunserver.conf`；该文件不存在则使用内置默认值。
+- **显式指定**：`--config <path>` 优先于 `STUN_CONFIG_PATH`，后者优先于默认路径；显式指定的文件不存在会直接报错退出。
 - **安装部署**：`deploy/Makefile` / `Makefile` 会把 `deploy/stunserver.conf.example` 安装为 `/opt/stunserver/etc/stunserver.conf`，systemd 通过 `--config` 指向它；Docker 镜像同样使用容器内 `./etc/stunserver.conf`。
-- **Docker 环境变量**：`docker/docker-entrypoint.sh` 使用 `STUN_CONFIG_PATH` 指定配置路径（默认 `/opt/stunserver/etc/stunserver.conf`）。
+- **环境变量**：服务端原生读取 `STUN_CONFIG_PATH`、`STUN_PORT`、`STUN_LOG_LEVEL`、`STUN_LISTEN_ADDRESS`，优先级为 CLI > 环境变量 > 配置文件 > 内置默认值；空值视为未设置。Docker 与直接部署行为一致。
+
+## 日志输出
+
+默认启用控制台输出（`enable_console = true`），文件日志默认关闭（`enable_file = false`）。需要写入文件时，在 `[logging]` 中设置 `enable_file = true`，并按需调整 `log_dir`、`file_prefix`、`max_file_size_mb`、`retention_days`、`compress_rotated_logs`。文件日志关闭时不会创建 `log_dir`。
 
 ## 本地开发
 
@@ -15,7 +19,7 @@
 # 从模板复制（首次或模板更新后），再把 log_dir 等路径改为相对路径
 cp deploy/stunserver.conf.example config/stunserver.conf
 
-# 在项目根目录直接启动，自动加载 config/stunserver.conf，日志写入 ./log/
+# 在项目根目录直接启动，自动加载 config/stunserver.conf，日志输出到控制台
 cargo run --bin stunserver
 
 # 或显式指定其他配置

@@ -71,14 +71,15 @@ sudo make status
 # 构建 Docker 镜像
 docker build -t stunserver:latest -f docker/Dockerfile .
 
-# 运行容器
+# 运行容器（host 网络模式，无需端口映射）
 docker run -d \
   --name stunserver \
-  -p 3478:3478/udp \
-  -p 3478:3478/tcp \
+  --network host \
   -v $(pwd)/logs:/opt/stunserver/log \
   stunserver:latest
 ```
+
+默认使用 host 网络模式，容器直接绑定宿主机的 UDP/TCP 3478，避免 Docker NAT。Linux 上使用 `--network host` 后 `-p` 不再需要。如果必须使用 bridge 网络，请改为发布端口；客户端地址探测仍然正常，但服务端无法通过 NAT 得知自己的公网地址（见 [Docker 网络与 NAT](#docker-网络与-nat)）。
 
 ## 配置说明
 
@@ -100,6 +101,7 @@ file_prefix = "stunserver"
 max_file_size_mb = 100
 retention_days = 30
 enable_console = true
+enable_file = false           # 文件日志默认关闭，需要时显式开启
 compress_rotated_logs = true  # 轮转文件 gzip 压缩为 *.gz
 
 [network]
@@ -113,14 +115,18 @@ tcp_idle_timeout_sec = 300
 应用。内核会把它们静默截断到 `net.core.rmem_max` 与 `net.core.wmem_max`；推荐的上限、
 持久化方式与 systemd 资源设置见 [系统优化](#系统优化)。
 
-### 环境变量（Docker）
+默认启用控制台日志。设置 `enable_file = true` 后才会额外写入 `log_dir` 下的轮转日志文件；关闭时不会创建日志目录。
 
-在 Docker 中运行时，可以通过环境变量覆盖配置：
+### 环境变量
 
-- `STUN_CONFIG_PATH`：配置文件路径（默认：`/opt/stunserver/etc/stunserver.conf`）
+服务端启动时会读取以下环境变量，Docker 与直接部署行为一致：
+
+- `STUN_CONFIG_PATH`：配置文件路径（默认：`config/stunserver.conf`）
 - `STUN_LOG_LEVEL`：日志级别（trace, debug, info, warn, error）
 - `STUN_PORT`：监听端口（默认：3478）
 - `STUN_LISTEN_ADDRESS`：监听地址（默认：0.0.0.0）
+
+优先级为 CLI 参数 > 环境变量 > 配置文件 > 内置默认值。空值视为未设置，显式指定的配置文件必须存在。
 
 ### 认证配置
 
@@ -257,11 +263,10 @@ Docker 镜像通过 GitHub Actions 自动构建并发布到 GitHub Container Reg
 # 拉取最新镜像
 docker pull ghcr.io/zhouhailin/stunserver:latest
 
-# 使用自定义配置运行
+# 使用自定义配置运行（host 网络模式）
 docker run -d \
   --name stunserver \
-  -p 3478:3478/udp \
-  -p 3478:3478/tcp \
+  --network host \
   -v $(pwd)/config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro \
   -v $(pwd)/logs:/opt/stunserver/log \
   ghcr.io/zhouhailin/stunserver:latest
@@ -270,15 +275,11 @@ docker run -d \
 ### Docker Compose
 
 ```yaml
-version: '3.8'
-
 services:
   stunserver:
     image: ghcr.io/zhouhailin/stunserver:latest
     container_name: stunserver
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
+    network_mode: host
     volumes:
       - ./config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro
       - ./logs:/opt/stunserver/log
@@ -286,6 +287,36 @@ services:
       - STUN_LOG_LEVEL=info
     restart: unless-stopped
 ```
+
+#### 无卷最小配置
+
+镜像内已包含 `/opt/stunserver/etc/stunserver.conf`，且默认启用控制台日志、关闭文件日志，因此以下配置不需要任何 volume：
+
+```yaml
+services:
+  stunserver:
+    image: ghcr.io/zhouhailin/stunserver:latest
+    container_name: stunserver
+    network_mode: host
+    environment:
+      - STUN_LOG_LEVEL=info
+    restart: unless-stopped
+```
+
+等价的 `docker run` 命令：
+
+```bash
+docker run -d \
+  --name stunserver \
+  --network host \
+  ghcr.io/zhouhailin/stunserver:latest
+```
+
+### Docker 网络与 NAT
+
+`docker run` 与 Compose 默认都使用 host 网络模式。容器共享宿主机的网络命名空间，服务直接绑定 `0.0.0.0:3478`，不经过容器 NAT，也不需要 `-p`。同一端口只能被一个进程占用，且容器会暴露宿主机的所有网络接口，请按需配置防火墙。macOS/Windows 上的 Docker Desktop 对 host 网络支持有限，请确认版本或继续使用 bridge 模式。
+
+bridge 模式（`-p 3478:3478/udp -p 3478:3478/tcp`）同样可以正常提供 STUN 服务：服务端返回的是它看到的客户端源地址，也就是客户端经过 NAT 后的公网地址。但服务端自身只能看到容器内网地址和转发后的端口，无法从 STUN 流量中推断宿主机的公网 IP 或外部端口。RFC 5389 Binding 并不需要服务端知道自己的公网地址，本服务也未实现 RFC 5780 的 NAT 行为发现，因此不会返回 RESPONSE-ORIGIN 或 OTHER-ADDRESS。如果后续需要对外通告公网地址，必须手动配置或通过外部服务探测，目前没有该配置项。
 
 ## 日志轮转
 

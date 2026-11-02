@@ -250,15 +250,27 @@ impl log::Log for StunLogger {
     }
 }
 
+/// Build a file logger when file logging is enabled.
+///
+/// Returns `None` without touching the filesystem when `enable_file` is false.
+fn file_logger_from_config(config: &LoggingConfig) -> Result<Option<FileLogger>, std::io::Error> {
+    if config.file_logging_enabled() {
+        FileLogger::new(config).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Initialize the logging subsystem based on the provided configuration.
 ///
 /// Sets up console logging, file logging, or both depending on config.
 /// Returns an error if file logging is requested but cannot be initialized.
 pub fn init_logging(config: &LoggingConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize file logger.
-    let file_logger = FileLogger::new(config)?;
-    if let Ok(mut guard) = FILE_LOGGER.lock() {
-        *guard = Some(file_logger);
+    // Initialize file logging only when explicitly enabled.
+    if let Some(file_logger) = file_logger_from_config(config)? {
+        if let Ok(mut guard) = FILE_LOGGER.lock() {
+            *guard = Some(file_logger);
+        }
     }
 
     // Create and install the global logger.
@@ -287,6 +299,7 @@ mod tests {
             max_file_size_mb: 1,
             retention_days: 3,
             enable_console: false,
+            enable_file: true,
             compress_rotated_logs: false,
         }
     }
@@ -298,6 +311,36 @@ mod tests {
         FILE_LOGGER_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn test_file_logger_from_config_disabled_creates_nothing() {
+        let dir = std::env::temp_dir().join("stunserver_test_file_logger_disabled");
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut config = test_logging_config(&dir);
+        config.enable_file = false;
+
+        assert!(file_logger_from_config(&config).unwrap().is_none());
+        assert!(
+            !dir.exists(),
+            "log directory must not be created when file logging is disabled"
+        );
+    }
+
+    #[test]
+    fn test_file_logger_from_config_enabled_creates_file() {
+        let dir = std::env::temp_dir().join("stunserver_test_file_logger_enabled");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let config = test_logging_config(&dir);
+        assert!(config.file_logging_enabled());
+
+        assert!(file_logger_from_config(&config).unwrap().is_some());
+        assert!(config.log_file_path().exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

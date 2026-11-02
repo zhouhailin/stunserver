@@ -54,7 +54,7 @@ USER stunserver
 # The server listens on UDP only, so probe it with a STUN Binding request and
 # require a response (20-byte header/prologue at minimum).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD test "$(printf '\000\001\000\000\041\022\244\102\000\000\000\000\000\000\000\000\000\000\000\000' | nc -u -w 2 127.0.0.1 3478 | wc -c)" -ge 20
+    CMD test "$(printf '\000\001\000\000\041\022\244\102\000\000\000\000\000\000\000\000\000\000\000\000' | nc -u -w 2 127.0.0.1 "${STUN_PORT:-3478}" | wc -c)" -ge 20
 
 # Entry point
 ENTRYPOINT ["./bin/stunserver"]

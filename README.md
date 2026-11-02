@@ -73,14 +73,15 @@ verification, and container notes.
 # Build Docker image
 docker build -t stunserver:latest -f docker/Dockerfile .
 
-# Run container
+# Run container (host networking; no port mapping required)
 docker run -d \
   --name stunserver \
-  -p 3478:3478/udp \
-  -p 3478:3478/tcp \
+  --network host \
   -v $(pwd)/logs:/opt/stunserver/log \
   stunserver:latest
 ```
+
+Host networking is the default so the server binds the host's UDP/TCP 3478 directly and avoids Docker NAT. On Linux, `--network host` makes `-p` unnecessary. If you must use bridge networking, publish the ports instead; client address discovery still works, but the server cannot learn its own public address through NAT (see [Docker Networking and NAT](#docker-networking-and-nat)).
 
 ## Configuration
 
@@ -102,6 +103,7 @@ file_prefix = "stunserver"
 max_file_size_mb = 100
 retention_days = 30
 enable_console = true
+enable_file = false           # file logging is opt-in; console is always available
 compress_rotated_logs = true  # gzip rotated files into *.gz
 
 [network]
@@ -116,14 +118,18 @@ when the socket is created. The kernel silently caps them at `net.core.rmem_max`
 `net.core.wmem_max`; see [System Tuning](#system-tuning) for the recommended limits,
 persistence, and the systemd resource settings.
 
-### Environment Variables (Docker)
+Console logging is enabled by default. Set `enable_file = true` to also write rotating log files under `log_dir`; when it is false, no log directory is created.
 
-When running in Docker, you can override configuration with environment variables:
+### Environment Variables
 
-- `STUN_CONFIG_PATH`: Configuration file path (default: `/opt/stunserver/etc/stunserver.conf`)
+The server reads these environment variables at startup, both in Docker and in direct deployments:
+
+- `STUN_CONFIG_PATH`: Configuration file path (default: `config/stunserver.conf`)
 - `STUN_LOG_LEVEL`: Log level (trace, debug, info, warn, error)
 - `STUN_PORT`: Listening port (default: 3478)
 - `STUN_LISTEN_ADDRESS`: Listen address (default: 0.0.0.0)
+
+Precedence is CLI args > environment variables > configuration file > built-in defaults. Empty values are ignored, and explicitly selected config files must exist.
 
 ### Authentication
 
@@ -262,11 +268,10 @@ Docker images are automatically built and published to GitHub Container Registry
 # Pull latest image
 docker pull ghcr.io/zhouhailin/stunserver:latest
 
-# Run with custom configuration
+# Run with custom configuration (host networking)
 docker run -d \
   --name stunserver \
-  -p 3478:3478/udp \
-  -p 3478:3478/tcp \
+  --network host \
   -v $(pwd)/config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro \
   -v $(pwd)/logs:/opt/stunserver/log \
   ghcr.io/zhouhailin/stunserver:latest
@@ -275,15 +280,11 @@ docker run -d \
 ### Docker Compose
 
 ```yaml
-version: '3.8'
-
 services:
   stunserver:
     image: ghcr.io/zhouhailin/stunserver:latest
     container_name: stunserver
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
+    network_mode: host
     volumes:
       - ./config/stunserver.conf:/opt/stunserver/etc/stunserver.conf:ro
       - ./logs:/opt/stunserver/log
@@ -291,6 +292,36 @@ services:
       - STUN_LOG_LEVEL=info
     restart: unless-stopped
 ```
+
+#### Minimal Configuration Without Volumes
+
+The image already contains `/opt/stunserver/etc/stunserver.conf`, and console logging is enabled by default with file logging off, so no volumes are required:
+
+```yaml
+services:
+  stunserver:
+    image: ghcr.io/zhouhailin/stunserver:latest
+    container_name: stunserver
+    network_mode: host
+    environment:
+      - STUN_LOG_LEVEL=info
+    restart: unless-stopped
+```
+
+The equivalent `docker run` command is:
+
+```bash
+docker run -d \
+  --name stunserver \
+  --network host \
+  ghcr.io/zhouhailin/stunserver:latest
+```
+
+### Docker Networking and NAT
+
+Host mode is the default for both `docker run` and Compose. The container shares the host network namespace, so the server binds `0.0.0.0:3478` directly; there is no container NAT and `-p` is not needed. Only one process can bind 3478, and all host interfaces are exposed, so apply firewall rules accordingly. Docker Desktop on macOS/Windows has limited host-network support; verify your version or keep bridge mode there.
+
+Bridge mode (`-p 3478:3478/udp -p 3478:3478/tcp`) also serves STUN correctly. The server replies with the client's reflexive address as observed on the socket, which is the client's post-NAT public address. The server itself only sees the container-private address and the forwarded port, so it cannot determine the host's public IP address or external port from STUN traffic. That is not required for RFC 5389 Binding, and this server does not implement RFC 5780 NAT behavior discovery (no RESPONSE-ORIGIN or OTHER-ADDRESS). If you need a server-advertised public address, it must be configured manually or discovered through an external service; no such option exists today.
 
 ## Log Rotation
 

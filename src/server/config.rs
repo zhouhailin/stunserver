@@ -7,7 +7,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -52,6 +52,10 @@ fn default_retention_days() -> u32 {
 
 fn default_enable_console() -> bool {
     true
+}
+
+fn default_enable_file() -> bool {
+    false
 }
 
 fn default_compress_rotated_logs() -> bool {
@@ -169,6 +173,9 @@ pub struct LoggingConfig {
     #[serde(default = "default_enable_console")]
     pub enable_console: bool,
 
+    #[serde(default = "default_enable_file")]
+    pub enable_file: bool,
+
     #[serde(default = "default_compress_rotated_logs")]
     pub compress_rotated_logs: bool,
 }
@@ -182,6 +189,7 @@ impl Default for LoggingConfig {
             max_file_size_mb: default_max_file_size_mb(),
             retention_days: default_retention_days(),
             enable_console: default_enable_console(),
+            enable_file: default_enable_file(),
             compress_rotated_logs: default_compress_rotated_logs(),
         }
     }
@@ -211,10 +219,8 @@ impl LoggingConfig {
     }
 
     /// Determine if file logging is enabled.
-    /// File logging is enabled when console is disabled or when log_dir is explicitly set.
     pub fn file_logging_enabled(&self) -> bool {
-        // Always enable file logging for now; console output is controlled by enable_console
-        true
+        self.enable_file
     }
 }
 
@@ -509,6 +515,12 @@ pub enum ConfigError {
     #[error("Invalid port number: {0}. Must be in range 1-65535")]
     InvalidPort(u16),
 
+    #[error("Invalid STUN_PORT value '{0}': must be an integer in range 1-65535")]
+    InvalidEnvPort(String),
+
+    #[error("Invalid STUN_LISTEN_ADDRESS value '{0}': must be an IP address")]
+    InvalidEnvListenAddress(String),
+
     #[error("Invalid log level: '{0}'. Valid options: trace, debug, info, warn, error")]
     InvalidLogLevel(String),
 
@@ -566,6 +578,67 @@ pub enum ConfigError {
 
 /// Configuration path loaded when `--config` is not provided.
 pub const DEFAULT_CONFIG_PATH: &str = "config/stunserver.conf";
+
+/// Environment variable overriding the configuration file path.
+pub const ENV_CONFIG_PATH: &str = "STUN_CONFIG_PATH";
+/// Environment variable overriding the listening port.
+pub const ENV_PORT: &str = "STUN_PORT";
+/// Environment variable overriding the log level.
+pub const ENV_LOG_LEVEL: &str = "STUN_LOG_LEVEL";
+/// Environment variable overriding the listen address.
+pub const ENV_LISTEN_ADDRESS: &str = "STUN_LISTEN_ADDRESS";
+
+/// Read an environment value through `get_env`, trimming surrounding
+/// whitespace and treating empty values as unset.
+fn non_empty_env<F>(get_env: &F, key: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env(key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Resolve the configuration path: `--config` wins, then `STUN_CONFIG_PATH`,
+/// otherwise `None` (the caller falls back to [`DEFAULT_CONFIG_PATH`]).
+pub fn resolve_config_path<F>(cli: Option<PathBuf>, get_env: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    cli.or_else(|| non_empty_env(&get_env, ENV_CONFIG_PATH).map(PathBuf::from))
+}
+
+/// Apply environment variable overrides to a loaded configuration.
+///
+/// Call this after loading the file and before applying CLI overrides so the
+/// precedence is CLI > environment > file > built-in defaults.
+pub fn apply_env_overrides<F>(config: &mut Config, get_env: F) -> Result<(), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = non_empty_env(&get_env, ENV_LISTEN_ADDRESS) {
+        value
+            .parse::<IpAddr>()
+            .map_err(|_| ConfigError::InvalidEnvListenAddress(value.clone()))?;
+        config.server.listen_address = value;
+    }
+
+    if let Some(value) = non_empty_env(&get_env, ENV_PORT) {
+        let port = value
+            .parse::<u16>()
+            .map_err(|_| ConfigError::InvalidEnvPort(value.clone()))?;
+        if port == 0 {
+            return Err(ConfigError::InvalidEnvPort(value));
+        }
+        config.server.port = port;
+    }
+
+    if let Some(value) = non_empty_env(&get_env, ENV_LOG_LEVEL) {
+        config.logging.level = value;
+    }
+
+    Ok(())
+}
 
 /// Load configuration from a TOML file.
 ///
@@ -673,7 +746,15 @@ mod tests {
         assert_eq!(config.server.port, 3478);
         assert_eq!(config.logging.level, "info");
         assert!(config.logging.enable_console);
+        assert!(!config.logging.enable_file);
         assert!(config.logging.compress_rotated_logs);
+    }
+
+    #[test]
+    fn test_deserialize_enable_file() {
+        let config: Config = toml::from_str("[logging]\nenable_file = true\n").unwrap();
+        assert!(config.logging.enable_file);
+        assert!(config.logging.file_logging_enabled());
     }
 
     #[test]
@@ -710,6 +791,7 @@ file_prefix = "test"
 max_file_size_mb = 50
 retention_days = 7
 enable_console = false
+enable_file = true
 
 [network]
 udp_recv_buffer_size = 2097152
@@ -730,6 +812,7 @@ enable_tls = false
         assert_eq!(config.logging.max_file_size_mb, 50);
         assert_eq!(config.logging.retention_days, 7);
         assert!(!config.logging.enable_console);
+        assert!(config.logging.enable_file);
         assert_eq!(config.network.udp_recv_buffer_size, 2097152);
         assert_eq!(config.network.tcp_connection_timeout_sec, 60);
         assert!(!config.security.enable_tls);
@@ -768,6 +851,7 @@ enable_tls = false
             max_file_size_mb: 100,
             retention_days: 30,
             enable_console: true,
+            enable_file: false,
             compress_rotated_logs: true,
         };
         assert_eq!(
@@ -785,6 +869,7 @@ enable_tls = false
             max_file_size_mb: 100,
             retention_days: 30,
             enable_console: true,
+            enable_file: false,
             compress_rotated_logs: true,
         };
         assert_eq!(config.max_file_size_bytes(), 100 * 1024 * 1024);
@@ -998,6 +1083,111 @@ enable_tls = false
         assert!(matches!(err, ConfigError::TomlError(_)));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- environment override tests ---
+
+    fn env_map(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn test_apply_env_overrides_all_values() {
+        let mut config = Config::default();
+        apply_env_overrides(
+            &mut config,
+            env_map(&[
+                (ENV_LISTEN_ADDRESS, "127.0.0.1"),
+                (ENV_PORT, "4000"),
+                (ENV_LOG_LEVEL, "debug"),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(config.server.listen_address, "127.0.0.1");
+        assert_eq!(config.server.port, 4000);
+        assert_eq!(config.logging.level, "debug");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_ignores_unset_and_blank() {
+        let mut config = Config::default();
+        config.server.port = 4001;
+
+        apply_env_overrides(
+            &mut config,
+            env_map(&[
+                (ENV_LISTEN_ADDRESS, "  "),
+                (ENV_PORT, ""),
+                (ENV_LOG_LEVEL, "\t"),
+                ("UNRELATED", "value"),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(config.server.listen_address, "0.0.0.0");
+        assert_eq!(config.server.port, 4001);
+        assert_eq!(config.logging.level, "info");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_rejects_invalid_port() {
+        for value in ["0", "abc", "70000"] {
+            let mut config = Config::default();
+            let err = apply_env_overrides(&mut config, env_map(&[(ENV_PORT, value)])).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidEnvPort(ref v) if v == value),
+                "unexpected error for {value}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_env_overrides_rejects_invalid_address() {
+        let mut config = Config::default();
+        let err = apply_env_overrides(&mut config, env_map(&[(ENV_LISTEN_ADDRESS, "example.org")]))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidEnvListenAddress(ref v) if v == "example.org"
+        ));
+    }
+
+    #[test]
+    fn test_invalid_env_log_level_fails_validation() {
+        let mut config = Config::default();
+        apply_env_overrides(&mut config, env_map(&[(ENV_LOG_LEVEL, "verbose")])).unwrap();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigError::InvalidLogLevel(_)
+        ));
+    }
+
+    #[test]
+    fn test_resolve_config_path_cli_wins() {
+        let cli = PathBuf::from("cli.toml");
+        let resolved =
+            resolve_config_path(Some(cli.clone()), env_map(&[(ENV_CONFIG_PATH, "env.toml")]));
+        assert_eq!(resolved, Some(cli));
+    }
+
+    #[test]
+    fn test_resolve_config_path_uses_env() {
+        let resolved = resolve_config_path(None, env_map(&[(ENV_CONFIG_PATH, " env.toml ")]));
+        assert_eq!(resolved, Some(PathBuf::from("env.toml")));
+    }
+
+    #[test]
+    fn test_resolve_config_path_none_when_unset_or_blank() {
+        assert_eq!(resolve_config_path(None, env_map(&[])), None);
+        assert_eq!(
+            resolve_config_path(None, env_map(&[(ENV_CONFIG_PATH, "  ")])),
+            None
+        );
     }
 
     #[test]
